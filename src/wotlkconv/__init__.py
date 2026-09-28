@@ -11,13 +11,13 @@ from .report import FileResult, Report, Status
 __version__ = "0.1.0"
 
 __all__ = [
-    "__version__",
     "TARGET_BUILD",
     "TARGET_PATCH",
-    "Options",
-    "TextureFormat",
-    "UnresolvedPolicy",
     "FileResult",
+    "Options",
     "Report",
     "Status",
+    "TextureFormat",
+    "UnresolvedPolicy",
+    "__version__",
 ]

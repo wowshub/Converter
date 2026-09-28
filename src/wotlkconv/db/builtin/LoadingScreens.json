@@ -1,0 +1,30 @@
+{
+  "table": "LoadingScreens",
+  "description": "Loading screen images. 3.3.5a names the image in FileName and derives the wide one from it; Legion moved both to FileDataID columns.",
+  "columns": [
+    {
+      "target": [
+        "FileName"
+      ],
+      "type": "string",
+      "resolve": "loadingscreens.file",
+      "note": "path of NarrowScreenFileDataID, else the 16:9, wide or main image"
+    },
+    {
+      "target": [
+        "HasWideScreen"
+      ],
+      "type": "uint",
+      "resolve": "loadingscreens.wide",
+      "note": "1 when WideScreenFileDataID is the narrow image's name plus 'wide'"
+    },
+    {
+      "target": [
+        "Name"
+      ],
+      "type": "string",
+      "resolve": "loadingscreens.name",
+      "note": "the image's file name when the row has no name of its own"
+    }
+  ]
+}

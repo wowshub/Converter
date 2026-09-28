@@ -1,8 +1,8 @@
 """Every file gets a deliberate decision, named or not."""
 
 import pytest
-
 from listfile_extensions import LISTFILE_EXTENSIONS, LISTFILE_TOTAL
+
 from wotlkconv import detect
 
 #: One real signature per format a modern build ships, so detection is tested
@@ -135,6 +135,9 @@ SIDECARS = {
     "_fogs.wdt": [("MVER", b"\0" * 4), ("MVFX", b"\0" * 16)],
     "_mpv.wdt": [("MVER", b"\0" * 4), ("MPVD", b"\0" * 16)],
     "_lod.adt": [("MVER", b"\0" * 4), ("MLHD", b"\0" * 16)],
+    # 12.1's ten _preload.wdt files carry a 4-byte MHDR, which read as terrain.
+    "_preload.wdt": [("MVER", b"\x12\0\0\0"), ("MHDR", b"\0" * 4),
+                     ("MMFE", b"\0" * 24)],
 }
 
 
@@ -153,6 +156,23 @@ def test_a_map_sidecar_is_skipped_saying_what_it_held(suffix, items):
     assert "never looks for the file" in reason
     assert reason != "a map sidecar carrying data added after Wrath; " \
                      "3.3.5a keeps none of this and never looks for the file"
+
+
+@pytest.mark.parametrize("suffix", ["_lgt.wdt", "_fogs.wdt", "_mpv.wdt"])
+def test_an_empty_map_sidecar_is_a_sidecar_not_terrain(suffix):
+    # Retail's zulaman_fogs.wdt is 12 bytes: MVER and nothing else, because
+    # the map has no fog.  Read as a split .adt piece, ~2,000 of these per
+    # build failed as "not an ADT" instead of being skipped.
+    empty = chunked([("MVER", b"\x12\0\0\0")])
+    path = f"world/maps/zulaman/zulaman{suffix}"
+    assert detect.detect(empty, path) == detect.MAP_SIDECAR
+    assert detect.classify(detect.MAP_SIDECAR, path)[0] == detect.SKIP
+
+
+def test_a_version_only_adt_is_still_a_split_terrain_piece():
+    empty = chunked([("MVER", b"\x12\0\0\0")])
+    assert detect.detect(empty, "world/maps/zulaman/zulaman_30_30_tex0.adt") \
+        == detect.ADT
 
 
 def test_a_real_wdt_is_still_a_wdt():
@@ -221,5 +241,5 @@ def test_the_biggest_formats_are_the_ones_worth_converting():
     for ext in (".blp", ".adt", ".skin", ".m2", ".wmo"):
         assert detect.classify(detect.UNKNOWN, f"x{ext}")[0] == detect.SKIP
         # ... by name alone; by content they are converted
-    assert detect.CONVERTIBLE >= {detect.BLP, detect.ADT, detect.SKIN,
-                                  detect.M2, detect.WMO_ROOT}
+    assert {detect.BLP, detect.ADT, detect.SKIN,
+                                  detect.M2, detect.WMO_ROOT} <= detect.CONVERTIBLE

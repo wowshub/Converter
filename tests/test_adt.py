@@ -1,13 +1,20 @@
 import struct
 
+import fixtures as F
 import pytest
 
-import fixtures as F
-from wotlkconv.adt.convert import (AdtParts, MCIN_ENTRY_SIZE, MCIN_SIZE_PAYLOAD_ONLY,
-                                   MCIN_SIZE_WITH_HEADER, MCNK_HEADER_SIZE,
-                                   _fold_holes, convert_adt, inspect_adt,
-                                   mcin_size_convention)
-from wotlkconv.chunks import ChunkReader
+from wotlkconv.adt.convert import (
+    MCIN_ENTRY_SIZE,
+    MCIN_SIZE_PAYLOAD_ONLY,
+    MCIN_SIZE_WITH_HEADER,
+    MCNK_HEADER_SIZE,
+    AdtParts,
+    _fold_holes,
+    convert_adt,
+    inspect_adt,
+    mcin_size_convention,
+)
+from wotlkconv.chunks import ChunkReader, ChunkWriter
 from wotlkconv.errors import MalformedFileError, UnsupportedFormatError
 from wotlkconv.limits import ADT_VERSION
 from wotlkconv.listfile import Listfile
@@ -150,8 +157,34 @@ def test_high_res_holes_are_converted_in_place(split_tile, listfile):
     hdr = mcnks[0].data[:MCNK_HEADER_SIZE]
     assert struct.unpack_from("<I", hdr, 0)[0] & 0x10000 == 0
     assert struct.unpack_from("<H", hdr, 0x3C)[0] == 0b1
-    assert hdr[0x40:0x50] == b"\0" * 16
+    # 0x40 is the low-quality texture map in both layouts, not the mask.
+    assert hdr[0x40:0x50] == bytes(range(0xA0, 0xB0))
     assert any(n.code == "adt.holes" for n in res.notes)
+
+
+def test_chunk_flags_follow_the_sub_chunks_written(listfile):
+    """Retail leaves "has shadows" and "has vertex colours" set on chunks it
+    no longer ships MCSH or MCCV for."""
+    root, tex, obj = F.build_split_adt(chunks=4)
+    cw = ChunkWriter(reverse=True)
+    for c in ChunkReader(tex, reverse=True):
+        if c.name != "MCNK":
+            cw.add(c.name, c.data)
+            continue
+        inner = ChunkWriter(reverse=True)
+        for sub in ChunkReader(c.data, reverse=True):
+            if sub.name != "MCSH":
+                inner.add(sub.name, sub.data)
+        cw.add("MCNK", inner.getvalue())
+    out, _res = convert_adt(AdtParts(root, cw.getvalue(), obj), "t.adt",
+                            Options(), listfile)
+    _named, mcnks = read_tile(out)
+    for mcnk in mcnks:
+        flags = struct.unpack_from("<I", mcnk.data, 0)[0]
+        subs = {c.name for c in ChunkReader(mcnk.data, reverse=True,
+                                            start=MCNK_HEADER_SIZE)}
+        assert "MCSH" not in subs and not flags & 0x1
+        assert "MCCV" in subs and flags & 0x40
 
 
 def test_a_monolithic_tile_is_passed_through(split_tile, listfile):
@@ -214,7 +247,7 @@ def test_unresolved_terrain_textures_get_placeholders(split_tile):
     out, res = convert_adt(AdtParts(root, tex, obj), "t.adt", Options(),
                            Listfile())
     named, _ = read_tile(out)
-    assert b"unresolved\\blp\\700001.blp" in named["MTEX"].data
+    assert b"unknown\\700001.blp" in named["MTEX"].data
     assert any(n.code == "adt.texture.placeholder" for n in res.notes)
 
 
@@ -315,3 +348,154 @@ def _restate_mcin_sizes(data: bytes, *, with_header: bool,
             struct.pack_into("<I", out, at + 4,
                              declared + 8 if with_header else declared)
     return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# Placements named by FileDataID
+# ---------------------------------------------------------------------------
+def _names(named, blob: str, ids: str) -> list[bytes]:
+    data = named[blob].data
+    offsets = struct.unpack_from(f"<{len(named[ids].data) // 4}I",
+                                 named[ids].data, 0)
+    return [data[o:data.index(b"\0", o)] for o in offsets]
+
+
+def _placements(named, name: str, size: int, flags_at: int):
+    data = named[name].data
+    return [(struct.unpack_from("<I", data, i)[0],
+             struct.unpack_from("<H", data, i + flags_at)[0])
+            for i in range(0, len(data), size)]
+
+
+def _refs(mcnk):
+    counts = struct.unpack_from("<I", mcnk.data, 0x10)[0], \
+        struct.unpack_from("<I", mcnk.data, 0x38)[0]
+    subs = {c.name: c.data for c in ChunkReader(mcnk.data, reverse=True,
+                                                start=MCNK_HEADER_SIZE)}
+    refs = list(struct.unpack_from(f"<{len(subs['MCRF']) // 4}I", subs["MCRF"], 0))
+    return refs[:counts[0]], refs[counts[0]:]
+
+
+def test_placements_named_by_file_data_id_get_their_name_tables_back(listfile):
+    """Retail writes MDDF/MODF entries keyed by FileDataID and no name tables;
+    3.3.5a (and Noggit, which crashed on it) can only follow a name index."""
+    root, tex, obj = F.build_split_adt(doodad_ids=(810001, 810002, 810001),
+                                       wmo_ids=(840001,), object_refs=1)
+    out, res = convert_adt(AdtParts(root, tex, obj), "t.adt", Options(), listfile)
+    named, _ = read_tile(out)
+
+    assert _names(named, "MMDX", "MMID") == [b"world\\doodads\\tree.m2",
+                                             b"world\\doodads\\rock.m2"]
+    assert _placements(named, "MDDF", 36, 34) == [(0, 0x1), (1, 0x1), (0, 0x1)]
+    assert _names(named, "MWMO", "MWID") == [b"world\\wmo\\dungeon\\keep.wmo"]
+    assert _placements(named, "MODF", 64, 56) == [(0, 0x1)]
+    assert any(n.code == "adt.doodad.resolved" for n in res.notes)
+
+    again, res = convert_adt(AdtParts(out), "t.adt", Options(), listfile)
+    assert res.status is Status.PASSTHROUGH and again == out
+
+
+def test_every_placement_table_is_written_even_when_empty(listfile):
+    """The reader seeks to MDDF and MODF through MHDR without checking for 0."""
+    root, tex, obj = F.build_split_adt(doodad_ids=(), wmo_ids=(),
+                                       doodad_refs=0, object_refs=0)
+    out, _res = convert_adt(AdtParts(root, tex, obj), "t.adt", Options(), listfile)
+    mhdr = struct.unpack_from("<12I", out, 20)
+    for i, name in enumerate(MHDR_FIELD_NAMES[:8]):
+        at = 20 + mhdr[1 + i]
+        assert mhdr[1 + i], name
+        assert out[at:at + 4] == name[::-1].encode(), name
+
+
+def test_unresolved_placements_get_placeholders():
+    root, tex, obj = F.build_split_adt(doodad_ids=(810001,), wmo_ids=(840001,),
+                                       doodad_refs=1, object_refs=1)
+    out, res = convert_adt(AdtParts(root, tex, obj), "t.adt", Options(), Listfile())
+    named, _ = read_tile(out)
+    assert _names(named, "MMDX", "MMID") == [b"unknown\\810001.m2"]
+    assert _names(named, "MWMO", "MWID") == [b"unknown\\840001.wmo"]
+    assert any(n.code == "adt.doodad.placeholder" for n in res.notes)
+
+
+def test_stripped_placements_take_their_map_chunk_references_with_them():
+    from wotlkconv.options import UnresolvedPolicy
+    lf = Listfile("<test>")
+    lf.update(["810002;world/doodads/rock.m2", "840001;world/wmo/dungeon/keep.wmo"])
+    root, tex, obj = F.build_split_adt(doodad_ids=(810001, 810002, 810001),
+                                       wmo_ids=(840001,), doodad_refs=3,
+                                       object_refs=1)
+    out, res = convert_adt(AdtParts(root, tex, obj), "t.adt",
+                           Options(unresolved=UnresolvedPolicy.STRIP), lf)
+    named, mcnks = read_tile(out)
+    assert _placements(named, "MDDF", 36, 34) == [(0, 0x1)]
+    assert _refs(mcnks[0]) == ([0], [0])
+    assert sum(n.code == "adt.doodad.stripped" for n in res.notes) == 2
+
+
+def test_unresolved_placements_can_fail_the_tile(listfile):
+    from wotlkconv.options import UnresolvedPolicy
+    root, tex, obj = F.build_split_adt(doodad_ids=(999999,), doodad_refs=1,
+                                       object_refs=0)
+    out, res = convert_adt(AdtParts(root, tex, obj), "t.adt",
+                           Options(unresolved=UnresolvedPolicy.FAIL), listfile)
+    assert res.status is Status.FAILED and out == b""
+    assert any(n.code == "adt.doodad.unresolved" for n in res.notes)
+
+
+def test_path_prefix_reaches_the_placement_names(listfile):
+    root, tex, obj = F.build_split_adt(doodad_ids=(810001,), wmo_ids=(840001,),
+                                       doodad_refs=1, object_refs=1)
+    out, _res = convert_adt(AdtParts(root, tex, obj), "t.adt",
+                            Options(path_prefix="patch"), listfile)
+    named, _ = read_tile(out)
+    assert _names(named, "MMDX", "MMID") == [b"patch\\world\\doodads\\tree.m2"]
+    assert _names(named, "MWMO", "MWID") == [b"patch\\world\\wmo\\dungeon\\keep.wmo"]
+
+
+def _with_doodad_set_lists(obj: bytes, entries, ranges, sets) -> bytes:
+    """Rewrite an _obj0's MODF flags/doodadSet words and add MWDR and MWDS."""
+    out = ChunkWriter(reverse=True)
+    for chunk in ChunkReader(obj, reverse=True):
+        data = chunk.data
+        if chunk.name == "MODF":
+            data = bytearray(data)
+            for i, (flags, doodad_set) in enumerate(entries):
+                struct.pack_into("<HH", data, i * 64 + 56, flags, doodad_set)
+            data = bytes(data)
+        out.add(chunk.name, data)
+        if chunk.name == "MODF":
+            out.add("MWDR", b"".join(struct.pack("<II", b, e) for b, e in ranges))
+            out.add("MWDS", struct.pack(f"<{len(sets)}H", *sets))
+    return out.getvalue()
+
+
+def test_a_placement_showing_several_doodad_sets_keeps_its_largest(listfile):
+    """Shadowlands placements list their sets in MWDS and put an MWDR index in
+    doodadSet (flag 0x80); read as a set, that index is an arbitrary one."""
+    root, tex, obj = F.build_split_adt(wmo_ids=(840001, 840001, 840001), object_refs=1)
+    obj = _with_doodad_set_lists(
+        obj, [(0x8 | 0x80, 1), (0x8 | 0x80, 0), (0x8, 5)],
+        ranges=[(0, 0), (1, 3)], sets=[0, 1, 2, 3])
+    sizes = {"world\\wmo\\dungeon\\keep.wmo": [40, 9, 120, 3]}
+    out, res = convert_adt(AdtParts(root, tex, obj), "t.adt", Options(), listfile,
+                           wmo_doodad_sets=sizes.get)
+    named, _ = read_tile(out)
+    modf = named["MODF"].data
+    assert [struct.unpack_from("<HH", modf, i * 64 + 56) for i in range(3)] == [
+        (0, 2),   # sets 1, 2 and 3: set 2 holds the most doodads
+        (0, 0),   # only the default set
+        (0, 0),   # set 5 of a world object with four
+    ]
+    codes = {n.code: n.level for n in res.notes}
+    assert codes["adt.wmo.doodad_sets"] == "lossy"
+    assert codes["adt.wmo.doodad_set_range"] == "lossy"
+    assert "MWDR" not in set(named)
+    assert "MWDS" not in str([n.message for n in res.notes if n.code == "adt.chunks.dropped"])
+
+
+def test_without_the_world_object_the_first_listed_set_is_kept(listfile):
+    root, tex, obj = F.build_split_adt(wmo_ids=(840001,), object_refs=1)
+    obj = _with_doodad_set_lists(obj, [(0x8 | 0x80, 0)], ranges=[(0, 2)], sets=[0, 4, 1])
+    out, res = convert_adt(AdtParts(root, tex, obj), "t.adt", Options(), listfile)
+    named, _ = read_tile(out)
+    assert struct.unpack_from("<HH", named["MODF"].data, 56) == (0, 4)

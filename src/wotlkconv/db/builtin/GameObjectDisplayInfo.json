@@ -1,9 +1,77 @@
 {
   "table": "GameObjectDisplayInfo",
   "description": "Model and collision box for a world object (doors, chests, buildings). The model column takes an .mdx path for an M2 or a .wmo path for a world object.",
-  "id_offset_columns": ["ID"],
+  "id_offset_columns": [
+    "ID"
+  ],
   "columns": [
-    {"target": ["ModelName", "ModelPath", "FileName"], "type": "string",
-     "from": ["FileDataID", "ModelName"], "transform": "model_path"}
+    {
+      "target": [
+        "ModelName",
+        "ModelPath",
+        "FileName"
+      ],
+      "type": "string",
+      "from": [
+        "FileDataID",
+        "ModelName"
+      ],
+      "transform": "model_path"
+    },
+    {
+      "target": [
+        "GeoBoxMin"
+      ],
+      "target_array_index": 0,
+      "type": "float",
+      "from": "GeoBox",
+      "array_index": 0,
+      "note": "GeoBox[6] is min xyz then max xyz"
+    },
+    {
+      "target": [
+        "GeoBoxMin"
+      ],
+      "target_array_index": 1,
+      "type": "float",
+      "from": "GeoBox",
+      "array_index": 1
+    },
+    {
+      "target": [
+        "GeoBoxMin"
+      ],
+      "target_array_index": 2,
+      "type": "float",
+      "from": "GeoBox",
+      "array_index": 2
+    },
+    {
+      "target": [
+        "GeoBoxMax"
+      ],
+      "target_array_index": 0,
+      "type": "float",
+      "from": "GeoBox",
+      "array_index": 3
+    },
+    {
+      "target": [
+        "GeoBoxMax"
+      ],
+      "target_array_index": 1,
+      "type": "float",
+      "from": "GeoBox",
+      "array_index": 4
+    },
+    {
+      "target": [
+        "GeoBoxMax"
+      ],
+      "target_array_index": 2,
+      "type": "float",
+      "from": "GeoBox",
+      "array_index": 5
+    }
   ]
 }

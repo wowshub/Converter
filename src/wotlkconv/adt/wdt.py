@@ -5,6 +5,11 @@ Small file, but terrain is unusable without it: ``MAIN`` says which of the
 finds. BfA added ``MAID``, which names every tile's files by FileDataID; 3.3.5a
 derives those names from the map name instead, so ``MAID`` is dropped.
 
+A map that is one big WMO (a dungeon, usually) places it with a single
+``MODF`` entry.  Since BfA that entry names the WMO by FileDataID and ``MWMO``
+is left out, which 3.3.5a cannot follow, so the name is looked up and written
+back -- the same repair terrain tiles get, see :mod:`.placements`.
+
 One flag matters more than the rest. ``MPHD.flags & 0x4`` ("big alpha") tells
 the client that ``MCAL`` holds 8-bit alpha maps rather than 4-bit ones.
 Cataclysm and later always write the 8-bit form, so a converted map needs that
@@ -20,8 +25,10 @@ import time
 from ..chunks import Chunk, ChunkReader, ChunkWriter, report_unknown
 from ..errors import MalformedFileError, UnsupportedFormatError
 from ..limits import ADT_VERSION
+from ..listfile import Listfile
 from ..options import Options
 from ..report import FileResult, Status
+from .placements import WMOS, rebuild_placements, restrict_placements
 
 MPHD_SIZE = 32
 MAIN_SIZE = 64 * 64 * 8
@@ -62,10 +69,22 @@ def parse_wdt(data: bytes, name: str = "<wdt>") -> dict[str, Chunk]:
     return chunks
 
 
+def _name_offsets(names: bytes) -> bytes:
+    """An MWID-style offset table for a WDT's MWMO, which has none."""
+    offsets = bytearray()
+    at = 0
+    for name in names.rstrip(b"\0").split(b"\0"):
+        offsets += struct.pack("<I", at)
+        at += len(name) + 1
+    return bytes(offsets)
+
+
 def convert_wdt(data: bytes, source_name: str, opts: Options,
-                result: FileResult | None = None) -> tuple[bytes, FileResult]:
+                result: FileResult | None = None,
+                listfile: Listfile | None = None) -> tuple[bytes, FileResult]:
     """Downgrade a WDT to the 3.3.5a layout."""
     started = time.time()
+    listfile = listfile or Listfile()
     res = result or FileResult(source=source_name, kind="wdt")
     res.kind = "wdt"
     res.bytes_in = len(data)
@@ -103,11 +122,17 @@ def convert_wdt(data: bytes, source_name: str, opts: Options,
 
     mwmo = chunks["MWMO"].data if "MWMO" in chunks else b""
     modf = chunks["MODF"].data if "MODF" in chunks else b""
+    wmos = rebuild_placements(WMOS, mwmo, _name_offsets(mwmo) if mwmo else b"",
+                              modf, opts, listfile, res, "wdt.wmo")
+    if wmos is None:
+        res.elapsed = time.time() - started
+        return b"", res
+    restricted = restrict_placements(WMOS, wmos, res, "wdt.wmo")
+    mwmo, modf = wmos.names, wmos.entries
     if masked & FLAG_GLOBAL_WMO and not mwmo:
         res.warn("wdt.global_wmo",
-                 "the map claims a global WMO but carries no MWMO filename; "
-                 "the reference may have been a FileDataID this tool cannot "
-                 "place in a name table")
+                 "the map claims a global WMO but carries no MWMO filename to "
+                 "load it by")
 
     mver = chunks.get("MVER")
     if mver is None or len(mver.data) < 4:
@@ -143,7 +168,8 @@ def convert_wdt(data: bytes, source_name: str, opts: Options,
     res.bytes_out = len(out)
     res.target_version = f"WDT v{ADT_VERSION}, {tiles} tiles present"
     res.extra["tiles"] = tiles
-    if not modern and res.status is Status.OK:
+    if (not modern and not wmos.changed and not restricted
+            and res.status is Status.OK):
         res.status = Status.PASSTHROUGH
         res.info("wdt.passthrough", "already a 3.3.5a map index")
     res.elapsed = time.time() - started

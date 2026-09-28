@@ -2,15 +2,22 @@
 
 import struct
 
+import casc_fixtures as CF
 import pytest
 
-import casc_fixtures as CF
 from wotlkconv.casc import CascStorage, KeyRing, blte
 from wotlkconv.casc.blte import EncryptedChunkError
 from wotlkconv.casc.config import parse_build_info, parse_config
 from wotlkconv.casc.encoding import EncodingTable
 from wotlkconv.casc.index import bucket_for, parse_index
-from wotlkconv.casc.root import RootTable
+from wotlkconv.casc.root import (
+    CONTENT_LOAD_ON_MACOS,
+    CONTENT_LOAD_ON_WINDOWS,
+    CONTENT_LOW_VIOLENCE,
+    CONTENT_NO_NAME_HASH,
+    LOCALE_ALL,
+    RootTable,
+)
 from wotlkconv.casc.salsa20 import arc4, salsa20
 from wotlkconv.casc.storage import FileNotInstalledError
 from wotlkconv.errors import MalformedFileError, MissingDependencyError
@@ -165,7 +172,7 @@ def test_config_values_split_on_whitespace():
 
 
 def test_opening_a_directory_that_is_not_an_install_explains_itself(tmp_path):
-    with pytest.raises(MissingDependencyError, match=".build.info"):
+    with pytest.raises(MissingDependencyError, match=r"\.build\.info"):
         CascStorage.open(tmp_path)
 
 
@@ -229,17 +236,77 @@ def test_root_table_reads_the_all_locales_flag():
     assert table.ckey_for(7) == b"z" * 16
 
 
-def test_root_table_reads_the_legacy_and_version_2_layouts():
+@pytest.mark.parametrize("kwargs", [
+    {"mfst": False}, {"mfst": True},
+    {"header_version": 1}, {"header_version": 2},
+])
+def test_root_table_reads_every_layout(kwargs):
     entries = {3: b"q" * 16, 9: b"r" * 16}
-    for kwargs in ({"mfst": False}, {"mfst": True}, {"version2": True}):
-        table = RootTable.parse(CF.make_root(entries, **kwargs))
-        assert sorted(table.file_ids()) == [3, 9], kwargs
+    table = RootTable.parse(CF.make_root(entries, **kwargs))
+    assert sorted(table.file_ids()) == [3, 9]
+    assert table.ckey_for(9) == b"r" * 16
 
 
-def test_root_table_skips_name_hashes_when_present():
-    entries = {2: b"n" * 16, 4: b"m" * 16}
-    table = RootTable.parse(CF.make_root(entries, with_names=True))
-    assert sorted(table.file_ids()) == [2, 4]
+@pytest.mark.parametrize("header_version", [0, 1, 2])
+def test_root_table_skips_name_hashes_when_present(header_version):
+    # A second block after the hashes proves they were stepped over exactly.
+    raw = CF.make_root_blocks([
+        ({2: b"n" * 16, 4: b"m" * 16}, 0, LOCALE_ALL),
+        ({6: b"o" * 16}, CONTENT_NO_NAME_HASH, LOCALE_ALL),
+    ], header_version=header_version)
+    table = RootTable.parse(raw)
+    assert sorted(table.file_ids()) == [2, 4, 6]
+    assert table.ckey_for(6) == b"o" * 16
+
+
+def test_a_version_2_root_is_not_read_with_the_old_block_header():
+    # 11.1 moved localeFlags ahead of the content flags and grew the header to
+    # 17 bytes; reading it as 12 finds a garbage record count in the first
+    # block and loses nearly the whole build.
+    blocks = [({i * 3 + 1: bytes([i]) * 16 for i in range(50)},
+               CONTENT_NO_NAME_HASH, 0x1F3F6),
+              ({1000 + i: bytes([i + 60]) * 16 for i in range(50)},
+               CONTENT_NO_NAME_HASH, 0x2)]
+    table = RootTable.parse(CF.make_root_blocks(blocks, header_version=2))
+    assert len(table) == 100 and not table.truncated
+    assert table.version == 2 and table.blocks == 2
+
+
+@pytest.mark.parametrize("header_version", [0, 2])
+def test_root_table_prefers_the_normal_variant_over_low_violence(header_version):
+    # Retail lists the low-violence copy of ~10k files *before* the normal
+    # one, so taking the first entry ships the censored asset.
+    raw = CF.make_root_blocks([
+        ({5: b"L" * 16}, CONTENT_NO_NAME_HASH | CONTENT_LOW_VIOLENCE, 0x1F3F6),
+        ({5: b"N" * 16}, CONTENT_NO_NAME_HASH, 0x1F3F6),
+    ], header_version=header_version)
+    assert RootTable.parse(raw).ckey_for(5) == b"N" * 16
+
+
+def test_root_table_prefers_windows_over_macos():
+    raw = CF.make_root_blocks([
+        ({5: b"M" * 16}, CONTENT_NO_NAME_HASH | CONTENT_LOAD_ON_MACOS, 0x2),
+        ({5: b"W" * 16}, CONTENT_NO_NAME_HASH | CONTENT_LOAD_ON_WINDOWS, 0x2),
+    ], header_version=2)
+    assert RootTable.parse(raw).ckey_for(5) == b"W" * 16
+
+
+def test_root_table_prefers_the_locale_but_keeps_files_only_others_have():
+    raw = CF.make_root_blocks([
+        ({5: b"D" * 16, 6: b"d" * 16}, CONTENT_NO_NAME_HASH, 0x8),   # deDE
+        ({5: b"E" * 16}, CONTENT_NO_NAME_HASH, 0x2),                 # enUS
+    ], header_version=2)
+    table = RootTable.parse(raw, locale=0x2)
+    assert table.ckey_for(5) == b"E" * 16
+    assert table.ckey_for(6) == b"d" * 16
+    assert RootTable.parse(raw, locale=0x8).ckey_for(5) == b"D" * 16
+
+
+def test_an_unknown_root_header_version_is_refused():
+    raw = bytearray(CF.make_root({1: b"x" * 16}, header_version=2))
+    struct.pack_into("<I", raw, 8, 3)
+    with pytest.raises(MalformedFileError, match="version 3"):
+        RootTable.parse(bytes(raw))
 
 
 def test_an_empty_root_is_an_error():
@@ -289,16 +356,15 @@ def test_a_file_outside_the_build_is_reported(install):
 def test_an_install_with_no_archive_fails_to_open(tmp_path):
     CF.build_install(tmp_path / "wow", {5: b"payload" * 100})
     (tmp_path / "wow" / "Data" / "data" / "data.000").unlink()
-    with pytest.raises(FileNotInstalledError, match="data.000"):
+    with pytest.raises(FileNotInstalledError, match=r"data\.000"):
         CascStorage.open(tmp_path / "wow")
 
 
 def test_a_file_streamed_from_the_cdn_is_reported_not_guessed(install):
     """Partial installs leave files out of the local index entirely."""
     root, _files = install
-    with CascStorage.open(root) as storage:
-        with pytest.raises(FileNotInstalledError, match="CDN"):
-            storage._read_by_ekey(b"\xee" * 16, "absent file")
+    with CascStorage.open(root) as storage, pytest.raises(FileNotInstalledError, match="CDN"):
+        storage._read_by_ekey(b"\xee" * 16, "absent file")
 
 
 def test_an_install_with_no_indices_explains_itself(tmp_path):
@@ -387,7 +453,7 @@ def test_a_file_that_is_only_listed_says_so_rather_than_being_fetched(
 
 def test_coverage_can_be_sampled_on_a_large_build(tmp_path):
     install = CF.build_install(tmp_path / "game",
-                               {i: b"x" * 8 for i in range(100)})
+                               dict.fromkeys(range(100), b"x" * 8))
     with CascStorage.open(install) as storage:
         full = storage.coverage()
         sampled = storage.coverage(sample=10)
@@ -418,3 +484,128 @@ def test_casc_info_on_a_complete_install_does_not_warn(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "1 of 1 files (100.0%)" in out
     assert "never fetches from the CDN" not in out
+
+
+# ---------------------------------------------------------------------------
+# Files the install does not store, from the CDN
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def cdn_install(tmp_path):
+    """Two files stored locally; the rest only on a CDN, archived or loose."""
+    cdn_files = {400 + i: bytes([i]) * (300 + i * 37) for i in range(12)}
+    cdn_files[500] = b"a loose file, kept outside any archive"
+    root = CF.build_install(tmp_path / "game", {100: b"stored one", 101: b"stored two"},
+                            cdn=cdn_files, cdn_loose={500}, chunk_size=64)
+    return root, cdn_files
+
+
+def test_a_cdn_index_is_searched_across_its_blocks(tmp_path):
+    from wotlkconv.casc.cdn import CdnIndex
+
+    entries = [(CF.md5(i.to_bytes(4, "big")), 100 + i, i % 7, 1000 * i)
+               for i in range(600)]                  # ~4 blocks of 157
+    path = tmp_path / "group.index"
+    path.write_bytes(CF.make_cdn_index(entries, 6))
+    index = CdnIndex(path)
+    try:
+        assert index.blocks == 4 and index.count == 600
+        for ekey, size, archive, offset in entries:
+            assert index.find(ekey) == (size, archive, offset)
+        assert index.find(CF.md5(b"not there")) is None
+        assert index.find(b"\xff" * 16) is None      # past the last block
+    finally:
+        index.close()
+
+
+def test_files_the_install_does_not_store_are_fetched_and_verified(cdn_install, tmp_path):
+    root, cdn_files = cdn_install
+    requests: list = []
+    with CascStorage.open(root, cdn_cache=tmp_path / "cache",
+                          cdn_fetch=CF.serve_cdn(root, log=requests)) as storage:
+        assert storage.read_file_id(100) == b"stored one"     # still local
+        assert not requests
+        for file_id, payload in cdn_files.items():
+            assert storage.read_file_id(file_id) == payload
+    ranged = [r for r in requests if r[2] is not None]
+    whole = [r for r in requests if r[2] is None]
+    assert len(ranged) == 12 and len(whole) == 1             # 12 archived, 1 loose
+    assert all(host == CF.CDN_HOSTS[0] for host, *_ in requests)
+
+
+def test_a_fetched_file_is_cached_and_never_fetched_twice(cdn_install, tmp_path):
+    root, cdn_files = cdn_install
+    first: list = []
+    with CascStorage.open(root, cdn_cache=tmp_path / "cache",
+                          cdn_fetch=CF.serve_cdn(root, log=first)) as storage:
+        storage.read_file_id(400)
+    again: list = []
+    with CascStorage.open(root, cdn_cache=tmp_path / "cache",
+                          cdn_fetch=CF.serve_cdn(root, log=again)) as storage:
+        assert storage.read_file_id(400) == cdn_files[400]
+    assert len(first) == 1 and again == []
+
+
+def test_a_download_that_does_not_match_its_key_is_refused_and_the_next_host_asked(
+        cdn_install, tmp_path):
+    root, cdn_files = cdn_install
+    fetch = CF.serve_cdn(root, corrupt_hosts={CF.CDN_HOSTS[0]})
+    with CascStorage.open(root, cdn_cache=tmp_path / "cache", cdn_fetch=fetch) as storage:
+        assert storage.read_file_id(401) == cdn_files[401]
+
+
+def test_when_every_host_fails_the_file_is_reported_and_nothing_is_cached(
+        cdn_install, tmp_path):
+    root, _ = cdn_install
+    fetch = CF.serve_cdn(root, corrupt_hosts={CF.CDN_HOSTS[0]},
+                         dead_hosts={CF.CDN_HOSTS[1]})
+    with CascStorage.open(root, cdn_cache=tmp_path / "cache", cdn_fetch=fetch) as storage:
+        data, why = storage.try_read_file_id(402)
+    assert data is None
+    assert "does not hash to its key" in why and "unreachable" in why
+    assert not list((tmp_path / "cache").rglob("*")) or \
+        not any(p.is_file() for p in (tmp_path / "cache").rglob("*"))
+
+
+def test_a_corrupted_cache_entry_is_fetched_again(cdn_install, tmp_path):
+    root, cdn_files = cdn_install
+    with CascStorage.open(root, cdn_cache=tmp_path / "cache",
+                          cdn_fetch=CF.serve_cdn(root)) as storage:
+        storage.read_file_id(403)
+    cached = next(p for p in (tmp_path / "cache").rglob("*") if p.is_file())
+    cached.write_bytes(b"BLTE" + bytes(40))
+    requests: list = []
+    with CascStorage.open(root, cdn_cache=tmp_path / "cache",
+                          cdn_fetch=CF.serve_cdn(root, log=requests)) as storage:
+        assert storage.read_file_id(403) == cdn_files[403]
+    assert len(requests) == 1
+
+
+def test_without_the_cdn_those_files_are_still_reported_not_fetched(cdn_install):
+    root, _ = cdn_install
+    with CascStorage.open(root) as storage:
+        data, why = storage.try_read_file_id(400)
+    assert data is None and "--casc-cdn" in why
+
+
+def test_a_download_whose_body_was_altered_fails_its_content_key(tmp_path):
+    # The encoding key covers only the BLTE header, so a damaged chunk body
+    # still matches it; the decoded content has to match the content key too.
+    payload = bytes(range(256)) * 4
+    root = CF.build_install(tmp_path / "game", {1: b"local"}, cdn={600: payload},
+                            chunk_size=256)
+    inner = CF.serve_cdn(root)
+
+    def tamper(url, offset, size):
+        data = bytearray(inner(url, offset, size))
+        header_size = struct.unpack_from(">I", data, 4)[0]
+        # Chunks are zlib; rewrite the last chunk as stored ('N') bytes of the
+        # same length so it still decodes, just to the wrong content.
+        last = len(data) - 64
+        if header_size and last > header_size:
+            data[last] = ord("N")
+        return bytes(data)
+
+    with CascStorage.open(root, cdn_cache=tmp_path / "cache", cdn_fetch=tamper) as storage:
+        data, why = storage.try_read_file_id(600)
+    assert data is None
+    assert "content key" in why or "inflate" in why or "expected" in why

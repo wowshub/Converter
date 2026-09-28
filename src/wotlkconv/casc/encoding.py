@@ -55,12 +55,12 @@ class EncodingTable:
         return hit[1] if hit else None
 
     @classmethod
-    def parse(cls, data: bytes, name: str = "<encoding>") -> "EncodingTable":
+    def parse(cls, data: bytes, name: str = "<encoding>") -> EncodingTable:
         if len(data) < 22 or data[:2] != MAGIC:
             raise MalformedFileError(
                 f"{name}: not an encoding table (magic {data[:2]!r})")
-        (version, ckey_size, ekey_size, ckey_page_kib, ekey_page_kib,
-         ckey_page_count, ekey_page_count, _unused,
+        (version, ckey_size, ekey_size, ckey_page_kib, _ekey_page_kib,
+         ckey_page_count, _ekey_page_count, _unused,
          espec_size) = struct.unpack_from(">BBBHHIIBI", data, 2)
         if version != 1:
             raise MalformedFileError(

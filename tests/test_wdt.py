@@ -1,10 +1,15 @@
 import struct
 
+import fixtures as F
 import pytest
 
-import fixtures as F
-from wotlkconv.adt.wdt import (FLAG_ADT_HAS_BIG_ALPHA, FLAG_GLOBAL_WMO,
-                               convert_wdt, inspect_wdt, parse_wdt)
+from wotlkconv.adt.wdt import (
+    FLAG_ADT_HAS_BIG_ALPHA,
+    FLAG_GLOBAL_WMO,
+    convert_wdt,
+    inspect_wdt,
+    parse_wdt,
+)
 from wotlkconv.errors import UnsupportedFormatError
 from wotlkconv.report import Status
 
@@ -76,6 +81,24 @@ def test_a_wrath_map_index_is_passed_through(opts):
     out = bytearray(cw.getvalue())
     _out, res = convert_wdt(bytes(out), "w.wdt", opts)
     assert res.status is Status.PASSTHROUGH
+
+
+def test_a_global_wmo_named_by_file_data_id_gets_its_name_back(opts, listfile):
+    """Retail places a dungeon's WMO by FileDataID and writes no MWMO."""
+    out, res = convert_wdt(F.build_modern_wdt(global_wmo_id=840001), "w.wdt",
+                           opts, listfile=listfile)
+    chunks = parse_wdt(out, "o")
+    assert chunks["MWMO"].data == b"world\\wmo\\dungeon\\keep.wmo\0"
+    name_id, = struct.unpack_from("<I", chunks["MODF"].data, 0)
+    flags, = struct.unpack_from("<H", chunks["MODF"].data, 56)
+    assert name_id == 0 and not flags & 0x8
+    assert res.status is not Status.PASSTHROUGH
+    assert not any(n.code == "wdt.global_wmo" for n in res.notes)
+
+
+def test_an_unresolved_global_wmo_gets_a_placeholder(opts):
+    out, _res = convert_wdt(F.build_modern_wdt(global_wmo_id=123), "w.wdt", opts)
+    assert parse_wdt(out, "o")["MWMO"].data == b"unknown\\123.wmo\0"
 
 
 def test_a_non_wdt_is_rejected():

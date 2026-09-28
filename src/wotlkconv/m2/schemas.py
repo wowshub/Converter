@@ -15,8 +15,12 @@ M2Particle       476 bytes                  492 bytes (+multi-texture)
 
 from __future__ import annotations
 
-from ..limits import (M2_CAMERA_SIZE_LEGION, M2_CAMERA_SIZE_WOTLK,
-                      M2_PARTICLE_SIZE_CATA, M2_PARTICLE_SIZE_WOTLK)
+from ..limits import (
+    M2_CAMERA_SIZE_LEGION,
+    M2_CAMERA_SIZE_WOTLK,
+    M2_PARTICLE_SIZE_CATA,
+    M2_PARTICLE_SIZE_WOTLK,
+)
 from .types import Schema
 
 # ---------------------------------------------------------------------------
@@ -137,27 +141,29 @@ _SEQUENCE_TAIL = [
 ]
 
 SEQUENCE_264 = Schema("M2Sequence@264",
-                      _SEQUENCE_HEAD + [("blend_time", ("p", "I"))] + _SEQUENCE_TAIL)
+                      [*_SEQUENCE_HEAD, ("blend_time", ("p", "I")), *_SEQUENCE_TAIL])
 SEQUENCE_272 = Schema("M2Sequence@272",
-                      _SEQUENCE_HEAD
-                      + [("blend_time_in", ("p", "H")), ("blend_time_out", ("p", "H"))]
-                      + _SEQUENCE_TAIL)
+                      [*_SEQUENCE_HEAD, ("blend_time_in", ("p", "H")), ("blend_time_out", ("p", "H")), *_SEQUENCE_TAIL])
 
 # ---------------------------------------------------------------------------
 # M2Camera
 # ---------------------------------------------------------------------------
-_CAMERA_HEAD = [
-    ("type", ("p", "I")),
+_CAMERA_CLIP = [
     ("far_clip", ("p", "f")),
     ("near_clip", ("p", "f")),
+]
+_CAMERA_BODY = [
     ("positions", ("trk", "splinevec3")),
     ("position_base", ("p", "fff")),
     ("target_position", ("trk", "splinevec3")),
     ("target_position_base", ("p", "fff")),
     ("roll", ("trk", "splinef32")),
 ]
-CAMERA_264 = Schema("M2Camera@264", _CAMERA_HEAD + [("fov", ("p", "f"))])
-CAMERA_272 = Schema("M2Camera@272", _CAMERA_HEAD + [("fov_track", ("trk", "splinef32"))])
+#: Wrath keeps the field of view as a scalar straight after the type (checked
+#: against 820 genuine 3.3.5a cameras); Cataclysm dropped it there and
+#: appended an animated track instead, in the same units.
+CAMERA_264 = Schema("M2Camera@264", [("type", ("p", "I")), ("fov", ("p", "f")), *_CAMERA_CLIP, *_CAMERA_BODY])
+CAMERA_272 = Schema("M2Camera@272", [("type", ("p", "I")), *_CAMERA_CLIP, *_CAMERA_BODY, ("fov_track", ("trk", "splinef32"))])
 
 # ---------------------------------------------------------------------------
 # M2Particle
@@ -222,20 +228,14 @@ _PARTICLE_BODY = [
 
 PARTICLE_264 = Schema(
     "M2Particle@264",
-    _PARTICLE_HEAD
-    + [("particle_type", ("p", "B")), ("head_or_tail", ("p", "B"))]
-    + _PARTICLE_BODY,
+    [*_PARTICLE_HEAD, ("particle_type", ("p", "B")), ("head_or_tail", ("p", "B")), *_PARTICLE_BODY],
 )
 
 #: Cata..TWW. The two bytes that were particle_type/head_or_tail became
 #: multi-texture parameters, and two 8-byte parameter blocks were appended.
 PARTICLE_CATA = Schema(
     "M2Particle@272",
-    _PARTICLE_HEAD
-    + [("multi_texture_param_x", ("p", "BB"))]
-    + _PARTICLE_BODY
-    + [("multi_texture_param0", ("p", "HHHH")),
-       ("multi_texture_param1", ("p", "HHHH"))],
+    [*_PARTICLE_HEAD, ("multi_texture_param_x", ("p", "BB")), *_PARTICLE_BODY, ("multi_texture_param0", ("p", "HHHH")), ("multi_texture_param1", ("p", "HHHH"))],
 )
 
 

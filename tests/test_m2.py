@@ -1,8 +1,8 @@
 import struct
 
+import fixtures as F
 import pytest
 
-import fixtures as F
 from wotlkconv.errors import UnsupportedFormatError
 from wotlkconv.limits import M2_VERSION
 from wotlkconv.m2 import schemas
@@ -121,6 +121,25 @@ def test_texture_file_ids_become_inline_paths(modern_m2, listfile):
     assert back.textures[1]["filename"] == "creature\\testbeast\\testbeast_normal.blp"
 
 
+def test_a_texture_with_no_file_never_becomes_an_empty_filename(listfile):
+    """Retail guild-emblem and character-extra types, and hardcoded slots with
+    FileDataID 0, have nothing to load; an empty hardcoded name sends 3.3.5a
+    and Noggit looking for a file called ""."""
+    m = F.build_modern_model(textures=4)
+    for tex, kind in zip(m.textures, (17, 24, 0, 0)):
+        tex["type"] = kind
+    m.texture_file_ids = [0, 900001, 0, 900000]
+    out, res, _ = convert_m2(F.serialise_modern_m2(m), "t.m2", Options(), listfile, None)
+    back = parse_m2(out, "o.m2")
+    assert [(t["type"], t.get("filename", "")) for t in back.textures] == [
+        (11, ""),                                              # emblem, no file
+        (0, "creature\\testbeast\\testbeast_normal.blp"),      # unknown type, has a file
+        (11, ""),                                              # hardcoded, no file
+        (0, "creature\\testbeast\\testbeast_skin.blp"),
+    ]
+    assert any(n.code == "m2.texture.missing" for n in res.notes)
+
+
 def test_path_prefix_is_applied(modern_m2, listfile):
     _model, raw = modern_m2
     out, _res, _ = convert(raw, listfile, path_prefix="custom\\mypatch")
@@ -134,7 +153,7 @@ def test_unresolved_reference_policies(modern_m2):
     empty = Listfile()
 
     out, res, _ = convert(raw, empty, unresolved=UnresolvedPolicy.PLACEHOLDER)
-    assert parse_m2(out, "o").textures[0]["filename"] == "unresolved\\blp\\900000.blp"
+    assert parse_m2(out, "o").textures[0]["filename"] == "unknown\\900000.blp"
     assert any(n.code == "m2.reference.placeholder" for n in res.notes)
 
     out, res, _ = convert(raw, empty, unresolved=UnresolvedPolicy.STRIP)
@@ -159,6 +178,75 @@ def test_camera_fov_track_becomes_a_scalar(modern_m2, listfile):
     assert "fov_track" not in cam
     assert cam["fov"] == pytest.approx(0.8)
     assert any(n.code == "m2.camera.fov" and n.level == "lossy" for n in res.notes)
+
+
+def test_camera_bytes_follow_the_wrath_layout(modern_m2, listfile):
+    # 3.3.5a: type, fov, far clip, near clip, then the tracks.  A reader at
+    # the wrong offset takes the near clip for the far one.
+    _model, raw = modern_m2
+    out, _res, _ = convert(raw, listfile)
+    count, offset = struct.unpack_from("<II", out, 0x110)
+    assert count == 1
+    cam_type, fov, far, near = struct.unpack_from("<Ifff", out, offset)
+    assert cam_type == 0
+    assert fov == pytest.approx(0.8)
+    assert far == pytest.approx(100.0) and near == pytest.approx(0.1)
+    # The positions track follows, its two sub-array tables in lockstep.
+    stamps, _at, values, _at = struct.unpack_from("<IIII", out, offset + 20)
+    assert stamps == values
+
+
+def test_a_camera_read_with_the_wrong_eras_layout_scores_low():
+    """A modern camera read as Wrath's takes the far clip (27.8) for the field
+    of view and the near clip for the far one; a first read that looks right
+    must end the search, since the other layout's arrays can be any size."""
+    from wotlkconv.m2.model import _plausible_camera
+    right = {"type": 0, "far_clip": 27.78, "near_clip": 0.22, "fov": 0.785}
+    shifted = {"type": 0, "fov": 27.78, "far_clip": 0.22, "near_clip": float("nan")}
+    assert _plausible_camera(right) == 8
+    assert _plausible_camera({k: v for k, v in right.items() if k != "fov"}) == 8
+    assert _plausible_camera(shifted) < 8
+
+
+def _packed_gravity_model(keys):
+    model = F.build_modern_model(sequences=1)
+    part = model.particles[0]
+    part["flags"] |= 0x800000
+    track = F.make_track("f32", 1, keys_per_sequence=len(keys))
+    track.kind = "gravity_packed"
+    track.values = [list(keys)]
+    part["gravity"] = track
+    return F.serialise_modern_m2(model)
+
+
+def test_packed_particle_gravity_becomes_a_downward_pull(listfile):
+    # (0, 0, -24): straight down, 24 steps of 0.04238648 -- a Wrath gravity of
+    # +1.017, the value the genuine CrackElfMale emitter carries (1.0417).
+    out, res, _ = convert(_packed_gravity_model([(0, 0, -24), (0, 0, 24)]), listfile)
+    p = parse_m2(out, "o.m2").particles[0]
+    assert not p["flags"] & 0x800000
+    assert p["gravity"].values[0] == pytest.approx([24 * 0.04238648, -24 * 0.04238648])
+    note = next(n for n in res.notes if n.code == "m2.particle.gravity")
+    assert note.level == "info"
+
+
+def test_sideways_packed_gravity_keeps_its_vertical_part(listfile):
+    # x = 64/128 leaves sqrt(1 - 0.25) of the pull pointing down.
+    out, res, _ = convert(_packed_gravity_model([(64, 0, -100)]), listfile)
+    g = parse_m2(out, "o.m2").particles[0]["gravity"].values[0][0]
+    assert g == pytest.approx(100 * 0.04238648 * (0.75 ** 0.5))
+    assert any(n.code == "m2.particle.gravity" and n.level == "lossy" for n in res.notes)
+
+
+def test_sequence_flags_keep_only_what_wrath_reads(listfile):
+    model = F.build_modern_model(sequences=3)
+    model.sequences[0]["flags"] = 0x20 | 0x800        # a later bit
+    model.sequences[1]["flags"] = 0x100               # "in the model", Legion's way
+    model.sequences[2]["flags"] = 0x40 | 0x200        # an alias, split blend time
+    out, res, _ = convert(F.serialise_modern_m2(model), listfile)
+    flags = [s["flags"] for s in parse_m2(out, "o.m2").sequences]
+    assert flags == [0x20, 0x20, 0x40]
+    assert any(n.code == "m2.flags.sequence" for n in res.notes)
 
 
 def test_particles_are_mapped_onto_the_wrath_layout(modern_m2, listfile):
@@ -279,7 +367,7 @@ def test_a_flat_model_is_never_guessed_at():
 
 def test_an_external_sub_array_keeps_the_offset_it_came_with():
     """Re-pointing it at the converted model would break the .anim link."""
-    from wotlkconv.m2.types import DeferredWriter, M2TRACK_SIZE
+    from wotlkconv.m2.types import M2TRACK_SIZE, DeferredWriter
 
     track = F.external_track("vec3", sequences=2, index=1, offset=4096)
     w = DeferredWriter()

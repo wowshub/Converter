@@ -1,0 +1,14 @@
+{
+  "table": "LiquidMaterial",
+  "description": "How a liquid is drawn. 3.3.5a knows vertex formats 0 to 2; Cataclysm's format 3 carries UVs as well as depth.",
+  "columns": [
+    {
+      "target": [
+        "LVF"
+      ],
+      "type": "int",
+      "from": "LVF",
+      "transform": "wrath_liquid_vertex_format"
+    }
+  ]
+}

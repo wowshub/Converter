@@ -33,7 +33,8 @@ from __future__ import annotations
 
 import dataclasses
 import struct
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 from .. import log
 from ..errors import MalformedFileError, UnsupportedFormatError
@@ -309,11 +310,23 @@ def _pallet_values(pallet_data: bytes, storage: FieldStorage) -> list[int]:
 
 
 def _coerce(raw: int, column: dbd.Column, storage: FieldStorage | None) -> Any:
+    """Interpret a stored value at the column's own width.
+
+    The storage says how many bits were spent *finding* the value -- a pallet
+    slot, a packed run -- not how wide the value is: pallet and common-data
+    entries are always 32 bits, and Blizzard leaves bits above a narrower
+    column's width set (12.1 GameObjectDisplayInfo.ObjectEffectPackageID
+    entries all read 0x76xxxx for a 16-bit column).  The definition's width is
+    the one the client's struct has, so that is where the value is cut and,
+    for a signed column, sign-extended.
+    """
     if column.type == "float":
         return as_float(raw)
-    width = storage.field_size_bits if storage else column.bit_width
-    if column.signed and column.type == "int" and width and width < 64:
-        return sign_extend(raw, width)
+    width = column.bit_width if 0 < column.bit_width <= 64 else 32
+    if width < 64:
+        raw &= (1 << width) - 1
+        if column.signed and column.type == "int":
+            return sign_extend(raw, width)
     return raw
 
 
@@ -398,7 +411,9 @@ def parse_db2(data: bytes, name: str = "<db2>",
             header.get("total_field_count", header["field_count"]),
             storages, header.get("id_index", 0))
 
-    inline = [c for c in table.columns if not (c.non_inline or c.relation)]
+    # A bare $relation$ is an ordinary foreign key stored in the record; only
+    # $noninline,relation$ lives in the relationship map.
+    inline = [c for c in table.columns if not c.non_inline]
     if storages and len(inline) != len(storages):
         log.warn(f"{name}: DBD lists {len(inline)} inline column(s) but the "
                  f"file has {len(storages)}; falling back to anonymous columns")
@@ -422,7 +437,23 @@ def parse_db2(data: bytes, name: str = "<db2>",
     _check_sections(data, table, sections, header, name)
 
     # -- sections -------------------------------------------------------
+    # A string field's offset counts from the field's position among *all*
+    # sections' records, and lands in all sections' string tables laid end to
+    # end.  Measuring from one section's own records is only right when there
+    # is a single section; a table with an encrypted section of unreleased
+    # rows has two or more, and every string read that way comes out of the
+    # middle of some other string.
+    strings = StringTables(
+        records_end=sum(sec.record_count for sec in sections) * table.record_size,
+        data=b"".join(
+            data[sec.file_offset + sec.record_count * table.record_size:
+                 sec.file_offset + sec.record_count * table.record_size
+                 + sec.string_table_size]
+            for sec in sections))
+    record_base = 0
     for section in sections:
+        section_base = record_base
+        record_base += section.record_count
         if section.encrypted:
             probe_at = section.file_offset
             probe = data[probe_at : probe_at + min(64, section.record_count *
@@ -434,7 +465,8 @@ def parse_db2(data: bytes, name: str = "<db2>",
                           f"{section.tact_key_hash:016X}; skipped")
                 continue
         _read_section(data, table, section, header, magic, inline, storages,
-                      caches, field_structs, id_column, name)
+                      caches, field_structs, id_column, name,
+                      strings, section_base)
 
     return table
 
@@ -467,7 +499,7 @@ def _check_sections(data: bytes, table: Db2Table, sections: list[Section],
 class _StorageCaches:
     """Per-column pallet slices and common-data maps, built once."""
 
-    __slots__ = ("pallets", "commons")
+    __slots__ = ("commons", "pallets")
 
     def __init__(self, pallet_data: bytes, common_data: bytes,
                  storages: list[FieldStorage]):
@@ -481,27 +513,43 @@ class _StorageCaches:
                 self.commons[index] = _common_map(common_data, storage)
 
 
+@dataclasses.dataclass(slots=True)
+class StringTables:
+    """Every section's string table, as string offsets address them."""
+
+    #: Bytes of record data across all sections, which the strings follow.
+    records_end: int = 0
+    data: bytes = b""
+
+
 def _read_section(data: bytes, table: Db2Table, section: Section, header: dict,
                   magic: str, inline: list[dbd.Column],
                   storages: list[FieldStorage], caches: _StorageCaches,
                   field_structs: list[tuple[int, int]],
-                  id_column: dbd.Column | None, name: str) -> None:
+                  id_column: dbd.Column | None, name: str,
+                  strings: StringTables | None = None,
+                  section_base: int = 0) -> None:
     sparse = bool(header.get("flags", 0) & FLAG_SPARSE)
     pos = section.file_offset
     record_size = table.record_size
 
+    modern_sparse = sparse and magic not in ("WDC2", "1SLC")
     if sparse:
         record_blobs = _read_sparse_records(data, table, section, header,
                                             magic, name)
         record_data = b""
-        string_data = b""
+        if modern_sparse:
+            # WDC3+: id list, copy table, offset map and relationships follow
+            # the variable-length records, not the start of the section.
+            pos = section.offset_records_end
     else:
         record_bytes = section.record_count * record_size
         record_data = data[pos : pos + record_bytes]
         pos += record_bytes
-        string_data = data[pos : pos + section.string_table_size]
         pos += section.string_table_size
         record_blobs = None
+        if strings is None:
+            strings = StringTables(record_bytes, data[pos - section.string_table_size:pos])
 
     id_list: list[int] = []
     if section.id_list_size:
@@ -516,6 +564,13 @@ def _read_section(data: bytes, table: Db2Table, section: Section, header: dict,
             new_id, old_id = struct.unpack_from("<II", data, pos + i * 8)
             copy_pairs.append((new_id, old_id))
         pos += copy_count * 8
+    if modern_sparse:
+        # The offset map (6 bytes an entry) and then the offset map's own id
+        # list (4 bytes an entry) come *before* the relationship data.  12.1
+        # CollectableSource*Sparse prove it: straight after the map sit the
+        # row ids, and the relationship header (count, min, max) only follows
+        # them.
+        pos += section.offset_map_id_count * (6 + 4)
 
     relationships: dict[int, int] = {}
     if section.relationship_data_size:
@@ -537,25 +592,31 @@ def _read_section(data: bytes, table: Db2Table, section: Section, header: dict,
         else:
             start = index * record_size
             blob = record_data[start : start + record_size]
+            # Where this record sits among every section's records.
+            global_start = (section_base + index) * record_size
             # The id has to come first: common-data columns are keyed by it.
             if id_list:
                 row_id = id_list[index] if index < len(id_list) else index
             elif id_position >= 0:
                 raw = _decode_column(
-                    blob, start, id_column,
+                    blob, global_start, id_column,
                     storages[id_position] if id_position < len(storages) else None,
-                    id_position, caches, record_data, string_data, index)
+                    id_position, caches, strings, index)
                 row_id = int(raw[0])
             else:
                 row_id = index
-            values = _decode_record(blob, start, inline, storages, caches,
-                                    record_data, string_data, row_id)
+            values = _decode_record(blob, global_start, inline, storages,
+                                    caches, strings, row_id)
 
         if id_column is not None:
             values[id_column.name] = row_id
+        # A sparse section's relationship entries name the row by its id, not
+        # its position (12.1 CollectableSourceQuestSparse: every entry's second
+        # field is one of the ids 22715..45422, with only 15172 records).
+        relation_key = row_id if modern_sparse else index
         for column in table.columns:
-            if column.relation:
-                values[column.name] = relationships.get(index, 0)
+            if column.relation and column.non_inline:
+                values[column.name] = relationships.get(relation_key, 0)
         table.rows[int(row_id)] = values
 
     for new_id, old_id in copy_pairs:
@@ -597,8 +658,9 @@ def _read_sparse_records(data: bytes, table: Db2Table, section: Section,
         cursor += (section.copy_table_count or 0) * 8
         map_offset = cursor
         count = section.offset_map_id_count or (table.max_id - table.min_id + 1)
-        # WDC3 keeps the row ids in their own list after the relationship data.
-        id_list_offset = (map_offset + count * 6 + section.relationship_data_size
+        # The offset map's id list follows the map directly; the relationship
+        # data comes after it, not before.
+        id_list_offset = (map_offset + count * 6
                           if section.offset_map_id_count else 0)
 
     if count <= 0 or count > 5_000_000:
@@ -646,8 +708,19 @@ def _decode_sparse_record(blob: bytes, inline: list[dbd.Column],
     pos = 0
     for index, column in enumerate(inline):
         storage = storages[index] if index < len(storages) else None
-        width = (storage.field_size_bits if storage else column.bit_width) or 32
-        size = max(1, width // 8)
+        if storage is not None and storage.storage_type != STORAGE_NONE:
+            raise UnsupportedFormatError(
+                f"{name}: sparse column {column.name!r} uses storage type "
+                f"{storage.storage_type}; sparse records are only understood "
+                f"with plain byte-aligned columns")
+        # field_size_bits covers the whole column, so an array's elements
+        # split it evenly (12.1 ItemSparse.StatPercentageOfSocket is 320 bits,
+        # ten 32-bit floats) -- the same rule as a non-sparse record.
+        if storage is not None:
+            width = storage.field_size_bits // max(1, column.array_size)
+        else:
+            width = column.bit_width
+        size = max(1, (width or 32) // 8)
         items = []
         for _ in range(column.array_size):
             if column.is_string:
@@ -656,7 +729,9 @@ def _decode_sparse_record(blob: bytes, inline: list[dbd.Column],
                     raise MalformedFileError(
                         f"{name}: an inline string in a sparse record is not "
                         f"terminated")
-                items.append(blob[pos:end].decode("latin-1"))
+                # UTF-8, like every other string in the file (12.1 Spell stores
+                # a right single quote as e2 80 99).
+                items.append(blob[pos:end].decode("utf-8", errors="replace"))
                 pos = end + 1
             else:
                 if pos + size > len(blob):
@@ -678,13 +753,12 @@ def _decode_sparse_record(blob: bytes, inline: list[dbd.Column],
 
 def _decode_record(blob: bytes, record_start: int, inline: list[dbd.Column],
                    storages: list[FieldStorage], caches: _StorageCaches,
-                   record_data: bytes, string_data: bytes,
-                   row_id: int) -> dict[str, Any]:
+                   strings: StringTables, row_id: int) -> dict[str, Any]:
     values: dict[str, Any] = {}
     for field_index, column in enumerate(inline):
         storage = storages[field_index] if field_index < len(storages) else None
         items = _decode_column(blob, record_start, column, storage, field_index,
-                               caches, record_data, string_data, row_id)
+                               caches, strings, row_id)
         if len(items) < column.array_size:
             items = list(items) + [0] * (column.array_size - len(items))
         values[column.name] = items[0] if column.array_size == 1 else items
@@ -693,8 +767,8 @@ def _decode_record(blob: bytes, record_start: int, inline: list[dbd.Column],
 
 def _decode_column(blob: bytes, record_start: int, column: dbd.Column,
                    storage: FieldStorage | None, field_index: int,
-                   caches: _StorageCaches, record_data: bytes,
-                   string_data: bytes, row_id: int) -> list[Any]:
+                   caches: _StorageCaches, strings: StringTables,
+                   row_id: int) -> list[Any]:
     if storage is None:
         return [0] * column.array_size
 
@@ -722,29 +796,31 @@ def _decode_column(blob: bytes, record_start: int, column: dbd.Column,
             return [sign_extend(raw, storage.field_size_bits)]
         return [_coerce(raw, column, storage)]
 
-    # STORAGE_NONE: one element per array slot, each field_size_bits wide.
+    # STORAGE_NONE: field_size_bits is the whole field, so an array's
+    # elements split it evenly (a float[6] GeoBox is 192 bits, 32 apiece).
     out: list[Any] = []
+    element_bits = storage.field_size_bits // max(1, column.array_size)
     for slot in range(column.array_size):
-        bit_offset = storage.field_offset_bits + slot * storage.field_size_bits
-        raw = read_bits(blob, bit_offset, storage.field_size_bits)
+        bit_offset = storage.field_offset_bits + slot * element_bits
+        raw = read_bits(blob, bit_offset, element_bits)
         if column.is_string:
-            # String offsets are relative to the field's own position in the
-            # record data block, which the string table follows.
+            # String offsets are relative to the field's own position among
+            # all the records, which the string tables follow.
             absolute = record_start + (bit_offset >> 3) + raw
-            out.append(_read_string(record_data, string_data, absolute))
+            out.append(_read_string(strings, absolute))
         else:
             out.append(_coerce(raw, column, storage))
     return out
 
 
-def _read_string(record_data: bytes, string_data: bytes, absolute: int) -> str:
-    offset = absolute - len(record_data)
-    if offset < 0 or offset >= len(string_data):
+def _read_string(strings: StringTables, absolute: int) -> str:
+    offset = absolute - strings.records_end
+    if offset < 0 or offset >= len(strings.data):
         return ""
-    end = string_data.find(b"\0", offset)
+    end = strings.data.find(b"\0", offset)
     if end < 0:
-        end = len(string_data)
-    return string_data[offset:end].decode("latin-1")
+        end = len(strings.data)
+    return strings.data[offset:end].decode("utf-8", errors="replace")
 
 
 def inspect_db2(data: bytes, source_name: str,

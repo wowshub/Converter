@@ -16,6 +16,10 @@ places, and recomputing every offset:
 * ``MCIN`` has to be built from scratch.
 * ``MHDR``'s offsets, which are relative to the start of its own payload, are
   rewritten to match the new layout.
+* Doodad and WMO placements that name their asset by FileDataID get the name
+  tables back (:mod:`.placements`), because 3.3.5a can only follow a name.
+* Liquid instances are re-encoded in the vertex formats 3.3.5a reads
+  (:mod:`.mh2o`).
 
 Cataclysm's high-resolution 8x8 hole mask is folded down to the 4x4 mask Wrath
 renders, and the chunks that only exist after Wrath are dropped.
@@ -40,13 +44,24 @@ import dataclasses
 import pathlib
 import struct
 import time
+from collections.abc import Callable
 
 from ..chunks import Chunk, ChunkReader, ChunkWriter, report_unknown
 from ..errors import MalformedFileError, UnsupportedFormatError
 from ..limits import ADT_MCNK_COUNT, ADT_VERSION
-from ..listfile import Listfile, normalise
+from ..listfile import Listfile, normalise, placeholder_path
 from ..options import Options, UnresolvedPolicy
 from ..report import FileResult, Status
+from .layers import limit_layers, remap_predominant
+from .mh2o import LiquidTypes, convert_mh2o
+from .placements import (
+    DOODADS,
+    WMOS,
+    choose_doodad_sets,
+    rebuild_placements,
+    remap_references,
+    restrict_placements,
+)
 
 MCNK_HEADER_SIZE = 128
 MCIN_ENTRY_SIZE = 16
@@ -56,8 +71,18 @@ MHDR_SIZE = 64
 MCIN_SIZE_WITH_HEADER = "chunk"
 MCIN_SIZE_PAYLOAD_ONLY = "payload"
 
-#: MCNK.flags bit meaning "the 8 bytes at 0x40 are an 8x8 hole mask".
+#: MCNK.flags bit meaning "the 8 bytes at 0x14 are an 8x8 hole mask".
 MCNK_FLAG_HIGH_RES_HOLES = 0x10000
+#: Where a split root keeps that mask: the MCVT/MCNR offset words it no
+#: longer needs.  (Checked against 24,832 Northrend and Outland chunks whose
+#: folded mask equals the 3.3.5a tile's own.)
+HIGH_RES_HOLES_OFFSET = 0x14
+MCNK_FLAG_HAS_MCSH = 0x1
+MCNK_FLAG_HAS_MCCV = 0x40
+#: MTXF bits 3.3.5a reads: "use the cube map, skip specular and height".
+MTXF_WRATH_FLAGS = 0x1
+MTXP_ENTRY_SIZE = 16
+SPECULAR_SUFFIX = "_s.blp"
 
 #: MCNK sub-chunks 3.3.5a reads, in emission order.
 SUBCHUNK_ORDER = ("MCVT", "MCCV", "MCNR", "MCLY", "MCRF", "MCSH", "MCAL",
@@ -86,7 +111,15 @@ MODERN_CHUNKS = {
     "MCBB": "per-chunk blend batches",
     "MCMT": "per-chunk terrain material ids",
     "MCDD": "per-chunk detail doodad disable mask",
+    "MWDR": "doodad set ranges for WMO placements",
+    "MWDS": "doodad set lists for WMO placements",
+    "MLMB": "per-WMO-placement LOD blend values",
+    "MPTX": "predominant-texture factors for layers past the fourth",
+    "MTCG": "terrain colour-grading references",
 }
+#: Modern chunks whose content is carried over in another form, so they are
+#: not reported as dropped.
+FOLDED_CHUNKS = {"MDID", "MWDR", "MWDS"}
 
 #: MHDR field order; the offsets are written back in this sequence.
 #: Everything a 3.3.5a tile is made of, top level and inside an MCNK.  Used to
@@ -227,8 +260,14 @@ def _fold_holes(high: bytes) -> int:
 
 
 def _resolve_textures(named: dict[str, list[Chunk]], opts: Options,
-                      listfile: Listfile, result: FileResult) -> bytes:
-    """Return an MTEX blob, building one from MDID FileDataIDs if needed."""
+                      listfile: Listfile, result: FileResult,
+                      file_exists: Callable[[int], bool] | None = None) -> bytes:
+    """Return an MTEX blob, building one from MDID FileDataIDs if needed.
+
+    Legion repointed terrain layers at ``<name>_s.blp``, the diffuse texture
+    with a specular mask in its alpha; the plain ``<name>.blp`` 3.3.5a names
+    still ships beside it, and is used whenever it does.
+    """
     mtex = _payload(named, "MTEX")
     if mtex:
         if not opts.path_prefix:
@@ -248,15 +287,22 @@ def _resolve_textures(named: dict[str, list[Chunk]], opts: Options,
 
     ids = struct.unpack_from("<" + "I" * (len(mdid) // 4), mdid, 0)
     blob = bytearray()
+    plain = 0
     for file_id in ids:
         path = listfile.path_for(file_id) if file_id else ""
+        if path and path.endswith(SPECULAR_SUFFIX):
+            plain_path = path[:-len(SPECULAR_SUFFIX)] + ".blp"
+            plain_id = listfile.id_for(plain_path)
+            if plain_id is not None and (file_exists is None or file_exists(plain_id)):
+                path = plain_path
+                plain += 1
         if path is None:
             if opts.unresolved is UnresolvedPolicy.FAIL:
                 result.fail("adt.texture.unresolved",
                             f"no listfile entry for terrain texture FileDataID "
                             f"{file_id}", file_id=file_id)
                 return b""
-            path = normalise(f"unresolved/blp/{file_id}.blp")
+            path = placeholder_path(file_id, "blp")
             result.lossy("adt.texture.placeholder",
                          f"terrain texture FileDataID {file_id} is not in the "
                          f"listfile; pointed it at {path}", file_id=file_id)
@@ -265,23 +311,53 @@ def _resolve_textures(named: dict[str, list[Chunk]], opts: Options,
         blob += path.encode("latin-1") + b"\0"
     result.info("adt.texture.resolved",
                 f"rebuilt MTEX from {len(ids)} MDID FileDataID(s)", count=len(ids))
+    if plain:
+        result.info("adt.texture.plain",
+                    f"named {plain} terrain texture(s) by their plain diffuse "
+                    f"file rather than the _s specular variant retail points "
+                    f"at", count=plain)
     return bytes(blob)
 
 
+def _mtxf_from_mtxp(mtxp: bytes, textures: int) -> bytes:
+    """Per-texture flags 3.3.5a reads, from the parameters Cataclysm replaced
+    them with; empty when no texture sets one."""
+    flags = [struct.unpack_from("<I", mtxp, i * MTXP_ENTRY_SIZE)[0] & MTXF_WRATH_FLAGS
+             for i in range(min(textures, len(mtxp) // MTXP_ENTRY_SIZE))]
+    if not any(flags):
+        return b""
+    flags += [0] * (textures - len(flags))
+    return struct.pack(f"<{textures}I", *flags)
+
+
 def _build_mcnk(header: bytes, pieces: dict[str, bytes], reverse: bool,
-                result: FileResult, counters: dict[str, int]) -> bytes:
+                result: FileResult, counters: dict[str, int],
+                remaps: tuple[dict[int, int] | None, dict[int, int] | None]
+                = (None, None), untextured: set[int] = frozenset(),
+                big_alpha: bool = True) -> bytes:
     """Reassemble one map chunk with 3.3.5a offsets."""
     hdr = bytearray(header[:MCNK_HEADER_SIZE])
     flags = struct.unpack_from("<I", hdr, 0)[0]
 
     if flags & MCNK_FLAG_HIGH_RES_HOLES:
-        low = _fold_holes(bytes(hdr[0x40:0x48]))
+        # A split root finds its sub-chunks by walking them, so the MCVT and
+        # MCNR offset words at 0x14 are free, and that is where the 8x8 mask
+        # lives. 0x40 still holds the low-quality texture map, as in Wrath.
+        low = _fold_holes(bytes(hdr[HIGH_RES_HOLES_OFFSET:HIGH_RES_HOLES_OFFSET + 8]))
         struct.pack_into("<H", hdr, 0x3C, low)
-        # Wrath reads those bytes as the low-quality texture map instead.
-        hdr[0x40:0x50] = b"\0" * 16
         flags &= ~MCNK_FLAG_HIGH_RES_HOLES
         counters["holes"] = counters.get("holes", 0) + 1
-    struct.pack_into("<I", hdr, 0, flags)
+
+    if "MCLY" in pieces:
+        limited = limit_layers(pieces["MCLY"], pieces.get("MCAL", b""),
+                               untextured, big_alpha)
+        if limited is not None:
+            pieces = dict(pieces, MCLY=limited.mcly, MCAL=limited.mcal)
+            hdr[0x40:0x50] = remap_predominant(bytes(hdr[0x40:0x50]), limited)
+            for key in ("untextured", "over_limit", "unreadable"):
+                counters[f"layers.{key}"] = (counters.get(f"layers.{key}", 0)
+                                             + getattr(limited, key))
+            counters["layers.chunks"] = counters.get("layers.chunks", 0) + 1
 
     layers = len(pieces.get("MCLY", b"")) // 16
     doodad_refs = len(pieces.get("MCRD", b"")) // 4
@@ -293,6 +369,15 @@ def _build_mcnk(header: bytes, pieces: dict[str, bytes], reverse: bool,
         # A monolithic source already merged them; trust the header's counts.
         doodad_refs = struct.unpack_from("<I", hdr, 0x10)[0]
         object_refs = struct.unpack_from("<I", hdr, 0x38)[0]
+
+    if remaps != (None, None):
+        # Placements were dropped, so every later entry moved down a slot.
+        refs = list(struct.unpack_from(f"<{len(mcrf) // 4}I", mcrf, 0))
+        doodads = remap_references(refs[:doodad_refs], remaps[0])
+        objects = remap_references(refs[doodad_refs:doodad_refs + object_refs],
+                                   remaps[1])
+        doodad_refs, object_refs = len(doodads), len(objects)
+        mcrf = struct.pack(f"<{doodad_refs + object_refs}I", *doodads, *objects)
 
     struct.pack_into("<I", hdr, 0x0C, layers)
     struct.pack_into("<I", hdr, 0x10, doodad_refs)
@@ -330,6 +415,12 @@ def _build_mcnk(header: bytes, pieces: dict[str, bytes], reverse: bool,
     # Wrath has no MCLV and ignores the last word; Cataclysm used both.
     struct.pack_into("<II", hdr, 0x78, 0, 0)
 
+    # Retail keeps "has shadows" and "has vertex colours" set on chunks whose
+    # MCSH and MCCV it no longer ships; the flags follow what is written.
+    for name, bit in (("MCSH", MCNK_FLAG_HAS_MCSH), ("MCCV", MCNK_FLAG_HAS_MCCV)):
+        flags = flags | bit if name in offsets else flags & ~bit
+    struct.pack_into("<I", hdr, 0, flags)
+
     return bytes(hdr) + body.getvalue()
 
 
@@ -347,8 +438,20 @@ def _learn_mcin(path: str, res: FileResult) -> tuple[str, str]:
 
 def convert_adt(parts: AdtParts, source_name: str, opts: Options,
                 listfile: Listfile | None = None,
-                result: FileResult | None = None) -> tuple[bytes, FileResult]:
-    """Merge a tile's pieces into one 3.3.5a ADT."""
+                result: FileResult | None = None,
+                liquid_types: LiquidTypes | None = None,
+                file_exists: Callable[[int], bool] | None = None,
+                wmo_doodad_sets: Callable[[str], list[int] | None] | None = None
+                ) -> tuple[bytes, FileResult]:
+    """Merge a tile's pieces into one 3.3.5a ADT.
+
+    ``liquid_types`` (read from the build's LiquidType and LiquidMaterial)
+    lets retail liquid be decoded by rule rather than from its block sizes.
+    ``file_exists`` says whether a FileDataID is in the build; without it the
+    listfile is taken at its word.  ``wmo_doodad_sets`` gives a placed world
+    object's doodad count per set, by path, to choose between the sets a
+    modern placement shows at once.
+    """
     started = time.time()
     res = result or FileResult(source=source_name, kind="adt")
     res.kind = "adt"
@@ -402,11 +505,15 @@ def convert_adt(parts: AdtParts, source_name: str, opts: Options,
                 return payload
         return b""
 
-    mtex = _resolve_textures(tex_named or root_named, opts, listfile, res)
+    mtex = _resolve_textures(tex_named or root_named, opts, listfile, res,
+                             file_exists)
     if not res.ok:
         res.elapsed = time.time() - started
         return b"", res
+    untextured = {i for i, name in enumerate(mtex.split(b"\0")[:-1]) if not name}
 
+    source_liquid = pick("MH2O")
+    liquid = convert_mh2o(source_liquid, liquid_types, res) if source_liquid else b""
     tables = {
         "MTEX": mtex,
         "MMDX": pick("MMDX"),
@@ -415,10 +522,26 @@ def convert_adt(parts: AdtParts, source_name: str, opts: Options,
         "MWID": pick("MWID"),
         "MDDF": pick("MDDF"),
         "MODF": pick("MODF"),
-        "MH2O": pick("MH2O"),
+        "MH2O": liquid,
         "MFBO": pick("MFBO"),
-        "MTXF": pick("MTXF"),
+        "MTXF": pick("MTXF") or _mtxf_from_mtxp(pick("MTXP"), mtex.count(b"\0")),
     }
+
+    # -- placements ------------------------------------------------------
+    doodads = rebuild_placements(DOODADS, tables["MMDX"], tables["MMID"],
+                                 tables["MDDF"], opts, listfile, res,
+                                 "adt.doodad")
+    wmos = rebuild_placements(WMOS, tables["MWMO"], tables["MWID"],
+                              tables["MODF"], opts, listfile, res, "adt.wmo")
+    if doodads is None or wmos is None:
+        res.elapsed = time.time() - started
+        return b"", res
+    choose_doodad_sets(wmos, pick("MWDR"), pick("MWDS"), wmo_doodad_sets, res,
+                       "adt.wmo")
+    restricted = (restrict_placements(DOODADS, doodads, res, "adt.doodad")
+                  + restrict_placements(WMOS, wmos, res, "adt.wmo"))
+    tables.update(MMDX=doodads.names, MMID=doodads.ids, MDDF=doodads.entries,
+                  MWMO=wmos.names, MWID=wmos.ids, MODF=wmos.entries)
 
     # -- map chunks ------------------------------------------------------
     # Every chunk name the three files carry, top level and inside an MCNK, so
@@ -437,13 +560,29 @@ def convert_adt(parts: AdtParts, source_name: str, opts: Options,
             pieces |= _subchunks(obj_mcnks[index].data, reverse)
         seen_chunks |= set(pieces)
         merged_mcnks.append(
-            _build_mcnk(chunk.data, pieces, reverse, res, counters))
+            _build_mcnk(chunk.data, pieces, reverse, res, counters,
+                        (doodads.remap, wmos.remap), untextured, split_source))
 
     if counters.get("holes"):
         res.lossy("adt.holes",
                   f"folded the 8x8 hole mask down to 4x4 on "
                   f"{counters['holes']} map chunk(s); 3.3.5a cannot punch "
                   f"sub-quadrant holes", chunks=counters["holes"])
+    if counters.get("layers.over_limit"):
+        res.lossy("adt.layers.limit",
+                  f"dropped {counters['layers.over_limit']} texture layer(s) that "
+                  f"showed least, so no map chunk has more than the four 3.3.5a "
+                  f"holds", layers=counters["layers.over_limit"])
+    if counters.get("layers.untextured"):
+        res.lossy("adt.layers.untextured",
+                  f"dropped {counters['layers.untextured']} texture layer(s) "
+                  f"whose texture has no file (FileDataID 0 in the source)",
+                  layers=counters["layers.untextured"])
+    if counters.get("layers.unreadable"):
+        res.lossy("adt.layers.unreadable",
+                  f"dropped {counters['layers.unreadable']} texture layer(s) "
+                  f"whose alpha map runs past the end of the chunk's MCAL",
+                  layers=counters["layers.unreadable"])
 
     # -- assemble --------------------------------------------------------
     out = bytearray()
@@ -473,14 +612,15 @@ def convert_adt(parts: AdtParts, source_name: str, opts: Options,
     append("MCIN", bytes(mcin_payload), always=True)
     mcin_data_pos = len(out) - len(mcin_payload)
 
+    # 3.3.5a seeks to every one of these through MHDR without checking the
+    # offset, so each is written even when it is empty.
     for name in ("MTEX", "MMDX", "MMID", "MWMO", "MWID", "MDDF", "MODF"):
-        append(name, tables[name], always=name in ("MTEX", "MMDX", "MMID",
-                                                   "MWMO", "MWID"))
+        append(name, tables[name], always=True)
     append("MH2O", tables["MH2O"])
 
     for index, payload in enumerate(merged_mcnks):
         chunk_pos = len(out)
-        out.extend((b"KNCM" if reverse else b"MCNK"))
+        out.extend(b"KNCM" if reverse else b"MCNK")
         out.extend(struct.pack("<I", len(payload)))
         out.extend(payload)
         if index < ADT_MCNK_COUNT:
@@ -505,11 +645,11 @@ def convert_adt(parts: AdtParts, source_name: str, opts: Options,
     report_unknown(res, seen_chunks, WOTLK_CHUNKS | set(MODERN_CHUNKS),
                    "terrain", "adt.chunks.unknown")
 
-    if modern:
+    if set(modern) - FOLDED_CHUNKS:
         res.lossy("adt.chunks.dropped",
                   "dropped chunks with no 3.3.5a equivalent: "
                   + ", ".join(f"{n} ({MODERN_CHUNKS[n]})" for n in modern
-                              if n not in ("MDID",)),
+                              if n not in FOLDED_CHUNKS),
                   chunks=modern)
     if split_source:
         res.warn("adt.big_alpha",
@@ -529,7 +669,9 @@ def convert_adt(parts: AdtParts, source_name: str, opts: Options,
                       "textures": tables["MTEX"].count(b"\0"),
                       "doodad_placements": len(tables["MDDF"]) // 36,
                       "wmo_placements": len(tables["MODF"]) // 64})
-    if not split_source and not modern and res.status is Status.OK:
+    if (not split_source and not modern and not doodads.changed
+            and not wmos.changed and not restricted and liquid == source_liquid
+            and not counters.get("layers.chunks") and res.status is Status.OK):
         res.status = Status.PASSTHROUGH
         res.info("adt.passthrough", "already a monolithic 3.3.5a tile")
     res.elapsed = time.time() - started

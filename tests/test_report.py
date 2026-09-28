@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from wotlkconv.report import FileResult, Report, Status
 
@@ -55,3 +56,61 @@ def test_summary_lists_failures_without_verbose():
     report.add(failed)
     lines = report.summary_lines()
     assert any("FAILED c.m2: it broke" in line for line in lines)
+
+
+def _mixed_results():
+    ok = FileResult(source="a.blp", kind="blp")
+    lossy = FileResult(source="b.m2", kind="m2")
+    lossy.lossy("m2.x", "lost", emitters=2)
+    failed = FileResult(source="c.m2", kind="m2")
+    failed.info("m2.i", "context that is not the reason")
+    failed.fail("m2.y", "it broke")
+    skipped = FileResult(source="d.tex", kind="tex", status=Status.SKIPPED)
+    return [ok, lossy, failed, skipped]
+
+
+def test_a_spooled_report_says_exactly_what_a_held_one_does(tmp_path):
+    # A whole build reports on ~2M files; holding them grew the process by
+    # gigabytes, so a big run writes each result to disk as it arrives.
+    held, spooled = Report(), Report(spool=tmp_path / "spool.jsonl")
+    for report in (held, spooled):
+        report.extend(_mixed_results())
+        report.close()
+
+    assert spooled.files == []                     # nothing kept per file
+    assert spooled.counts() == held.counts()
+    assert spooled.accounting() == held.accounting()
+    assert [(f.source, [n.message for n in f.notes]) for f in spooled.failed] \
+        == [("c.m2", ["it broke"])]
+    assert spooled.summary_lines() == held.summary_lines()
+    assert spooled.summary_lines(verbose=True) == held.summary_lines(verbose=True)
+
+    for name, report in (("held.json", held), ("spooled.json", spooled)):
+        report.write_json(tmp_path / name)
+    held_json = json.loads((tmp_path / "held.json").read_text())
+    spooled_json = json.loads((tmp_path / "spooled.json").read_text())
+    for key in ("counts", "accounting", "files", "target"):
+        assert spooled_json[key] == held_json[key]
+
+
+def test_a_report_spooled_to_nowhere_still_counts(tmp_path):
+    import os
+
+    report = Report(spool=Path(os.devnull))
+    report.extend(_mixed_results())
+    report.close()
+    assert report.counts() == {"ok": 1, "lossy": 1, "failed": 1, "skipped": 1}
+    assert report.accounting()["inputs"] == 4
+    assert [f.source for f in report.failed] == ["c.m2"]
+
+
+def test_a_report_spools_into_an_output_folder_that_does_not_exist_yet(tmp_path):
+    # A fresh --out folder is only created when the first file is written, and
+    # the planner's results reach the spool before that.
+    spool = tmp_path / "new-patch" / "wotlkconv-report.results.jsonl"
+    report = Report(spool=spool)
+    report.extend(_mixed_results())
+    report.close()
+    report.write_json(tmp_path / "new-patch" / "wotlkconv-report.json")
+    assert spool.is_file()
+    assert report.counts()["failed"] == 1

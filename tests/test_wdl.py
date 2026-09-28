@@ -2,11 +2,10 @@
 
 import struct
 
+import fixtures as F
 import pytest
 
-import fixtures as F
-from wotlkconv.adt.wdl import (MAOF_ENTRIES, MARE_SIZE, WDL_VERSION,
-                               convert_wdl, inspect_wdl)
+from wotlkconv.adt.wdl import MAOF_ENTRIES, MARE_SIZE, WDL_VERSION, convert_wdl, inspect_wdl
 from wotlkconv.chunks import ChunkReader
 from wotlkconv.errors import MalformedFileError, UnsupportedFormatError
 from wotlkconv.options import Options

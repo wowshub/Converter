@@ -16,7 +16,7 @@ out from a set of names it expects to see.
 from __future__ import annotations
 
 import dataclasses
-from typing import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 
 from .binio import Reader
 from .errors import MalformedFileError, TruncatedFileError
@@ -75,7 +75,7 @@ class ChunkReader:
 
     @classmethod
     def auto(cls, data: bytes, known: Iterable[str], *, name: str = "<memory>",
-             start: int = 0) -> "ChunkReader":
+             start: int = 0) -> ChunkReader:
         return cls(data, reverse=detect_reversal(data[start:], known),
                    name=name, start=start)
 

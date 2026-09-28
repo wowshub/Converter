@@ -1,0 +1,17 @@
+{
+  "table": "GroundEffectDoodad",
+  "description": "Ground clutter models. 3.3.5a names each by a bare file name the client loads from World\\NoDXT\\Detail; retail names it by FileDataID.",
+  "requires_tables": [
+    "GroundEffectDoodad"
+  ],
+  "columns": [
+    {
+      "target": [
+        "Doodadpath"
+      ],
+      "type": "string",
+      "resolve": "grounddoodad.path",
+      "note": "models outside the detail folder are copied into it"
+    }
+  ]
+}

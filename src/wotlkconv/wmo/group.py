@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import struct
-from typing import Sequence
+from collections.abc import Sequence
 
 from ..chunks import Chunk, ChunkReader, ChunkWriter, report_unknown
 from ..errors import MalformedFileError, UnsupportedFormatError
@@ -27,9 +27,14 @@ from ..limits import (
     MOBA_SIZE,
     MOGP_HEADER_SIZE,
     WMO_GROUP_CHUNKS_KNOWN,
+    WMO_GROUP_FLAG_HAS_BSP,
+    WMO_GROUP_FLAG_HAS_DOODADS,
+    WMO_GROUP_FLAG_HAS_LIGHTS,
+    WMO_GROUP_FLAG_HAS_PORTAL_BATCHES,
     WMO_GROUP_FLAG_HAS_TWO_MOCV,
     WMO_GROUP_FLAG_HAS_TWO_MOTV,
     WMO_GROUP_FLAG_HAS_VERTEX_COLORS,
+    WMO_GROUP_FLAG_HAS_WATER,
     WMO_GROUP_FLAG_MASK,
     WMO_MAX_COLOR_LAYERS,
     WMO_MAX_GROUP_VERTICES,
@@ -39,6 +44,7 @@ from ..limits import (
 from ..options import Options
 from ..report import FileResult, Status
 from . import split as splitter
+from .bsp import build_bsp
 
 #: Post-Wrath group sub-chunks, with what each one carries.
 MODERN_GROUP_CHUNKS = {
@@ -65,6 +71,7 @@ MODERN_GROUP_CHUNKS = {
     "MPBP": "prepass portals",
     "MPBI": "prepass indices",
     "MPBG": "prepass groups",
+    "MOGX": "query face start",
 }
 
 ALL_KNOWN = set(WMO_GROUP_CHUNKS_KNOWN) | set(MODERN_GROUP_CHUNKS)
@@ -229,30 +236,52 @@ def _emit_group(header: bytearray, reverse: bool, *, polys: bytes,
                 uvs: Sequence[bytes], batches: bytes, colours: Sequence[bytes],
                 extras: dict[str, bytes], mobn: bytes = b"",
                 mobr: bytes = b"") -> bytes:
-    """Write one MVER + MOGP group file from already-prepared arrays."""
+    """Write one MVER + MOGP group file from already-prepared arrays.
+
+    The flags that announce optional chunks are set from what is written:
+    3.3.5a reads an optional chunk wherever its flag is set without checking
+    the name, so a flag left on for a chunk retail moved elsewhere (lights,
+    5,850 retail groups) makes it read the next chunk in its place.
+    """
+    flags = struct.unpack_from("<I", header, 8)[0]
+    for present, bit in ((bool(extras.get("MOLR")), WMO_GROUP_FLAG_HAS_LIGHTS),
+                         (bool(extras.get("MODR")), WMO_GROUP_FLAG_HAS_DOODADS),
+                         (bool(extras.get("MLIQ")), WMO_GROUP_FLAG_HAS_WATER),
+                         (bool(mobn), WMO_GROUP_FLAG_HAS_BSP),
+                         (False, WMO_GROUP_FLAG_HAS_PORTAL_BATCHES)):
+        flags = flags | bit if present else flags & ~bit
+    struct.pack_into("<I", header, 8, flags)
     inner = ChunkWriter(reverse=reverse)
-    if polys:
-        inner.add("MOPY", polys)
-    if indices:
-        inner.add("MOVI", struct.pack("<" + "H" * len(indices), *indices))
-    if vertices:
-        inner.add("MOVT", vertices)
-    if normals:
-        inner.add("MONR", normals)
-    for uv in uvs:
-        inner.add("MOTV", uv)
-    if batches:
-        inner.add("MOBA", batches)
+    # MOPY, MOVI, MOVT, MONR, MOTV and MOBA are read unconditionally and in
+    # this order, so each is written even when it is empty: 3.3.5a's own
+    # groups always have all six (an empty MOBA on groups that draw nothing),
+    # and a reader missing one takes the next chunk for it.  A group with
+    # vertices but no UVs (collision geometry) gets zeroed coordinates, so the
+    # coordinate array still matches the vertices.
+    inner.add("MOPY", polys)
+    inner.add("MOVI", struct.pack("<" + "H" * len(indices), *indices))
+    inner.add("MOVT", vertices)
+    inner.add("MONR", normals)
+    # The order is fixed, not just conventional: 3.3.5a's own groups and
+    # Noggit's reader expect the second UV and colour layers at the very end,
+    # after the liquid.  A second MOTV straight after the first is read as
+    # MOBA, and every batch after it is garbage.
+    inner.add("MOTV", uvs[0] if uvs else bytes(8 * (len(vertices) // 12)))
+    inner.add("MOBA", batches)
     for name in ("MOLR", "MODR"):
         if extras.get(name):
             inner.add(name, extras[name])
     if mobn:
         inner.add("MOBN", mobn)
         inner.add("MOBR", mobr)
-    for colour in colours:
-        inner.add("MOCV", colour)
+    if colours:
+        inner.add("MOCV", colours[0])
     if extras.get("MLIQ"):
         inner.add("MLIQ", extras["MLIQ"])
+    for uv in uvs[1:]:
+        inner.add("MOTV", uv)
+    for colour in colours[1:]:
+        inner.add("MOCV", colour)
 
     outer = ChunkWriter(reverse=reverse)
     outer.add("MVER", struct.pack("<I", WMO_VERSION))
@@ -344,12 +373,25 @@ def convert_group_parts(data: bytes, source_name: str, opts: Options,
     oversized = vertex_count > WMO_MAX_GROUP_VERTICES
 
     if not oversized:
+        mobn = by_name.get("MOBN", [b""])[0]
+        mobr = by_name.get("MOBR", [b""])[0]
+        if not mobn and indices and vertex_count:
+            # Every 3.3.5a group with triangles has a collision tree; without
+            # one the client lets players walk through the group.
+            positions = [struct.unpack_from("<3f", vertices, i * 12)
+                         for i in range(vertex_count)]
+            triangles = [tuple(indices[i:i + 3])
+                         for i in range(0, len(indices) - 2, 3)]
+            mobn, mobr = build_bsp(positions, triangles)
+            res.info("wmo.group.bsp_built",
+                     f"built a collision tree over {len(triangles)} triangles; "
+                     f"the source group shipped none",
+                     triangles=len(triangles))
         out = _emit_group(header, group.reverse_magic, polys=polys,
                           indices=indices, vertices=vertices,
                           normals=by_name.get("MONR", [b""])[0], uvs=uvs,
                           batches=batches, colours=colours, extras=extras,
-                          mobn=by_name.get("MOBN", [b""])[0],
-                          mobr=by_name.get("MOBR", [b""])[0])
+                          mobn=mobn, mobr=mobr)
         res.bytes_out = len(out)
         res.target_version = f"WMO group v{WMO_VERSION}, {vertex_count} vertices"
         if not modern_seen and res.status is Status.OK:

@@ -99,8 +99,15 @@ def _lz4_block_decompress(data: bytes, expected: int) -> bytes:
     return bytes(out)
 
 
-def _decode_encrypted(payload: bytes, block_index: int, keys, expected: int) -> bytes:
-    """Unwrap an ``E`` chunk: ``keyNameSize keyName ivSize iv type payload``."""
+def _decode_encrypted(payload: bytes, block_index: int, keys, expected: int,
+                      zero_missing: bool = False) -> bytes:
+    """Unwrap an ``E`` chunk: ``keyNameSize keyName ivSize iv type payload``.
+
+    With ``zero_missing``, a chunk whose key is not known decodes to zeros of
+    its declared size instead of failing the whole file.  That is only right
+    for a reader that recognises the hole -- a WDC database skips a section
+    flagged encrypted whose bytes are zero -- so it is off by default.
+    """
     if len(payload) < 1:
         raise MalformedFileError("empty encrypted chunk")
     pos = 0
@@ -120,6 +127,8 @@ def _decode_encrypted(payload: bytes, block_index: int, keys, expected: int) -> 
 
     key = keys.get(key_name) if keys is not None else None
     if key is None:
+        if zero_missing and expected:
+            return bytes(expected)
         raise EncryptedChunkError(key_name)
 
     # The IV is mixed with the chunk index so identical plaintext in different
@@ -137,10 +146,11 @@ def _decode_encrypted(payload: bytes, block_index: int, keys, expected: int) -> 
     else:
         raise UnsupportedFormatError(
             f"unknown BLTE encryption type {enc_type!r}")
-    return _decode_chunk(plain, block_index, keys, expected)
+    return _decode_chunk(plain, block_index, keys, expected, zero_missing)
 
 
-def _decode_chunk(data: bytes, block_index: int, keys, expected: int) -> bytes:
+def _decode_chunk(data: bytes, block_index: int, keys, expected: int,
+                  zero_missing: bool = False) -> bytes:
     if not data:
         return b""
     mode = data[0:1]
@@ -155,9 +165,10 @@ def _decode_chunk(data: bytes, block_index: int, keys, expected: int) -> bytes:
     if mode == b"4":
         return _lz4_block_decompress(body, expected)
     if mode == b"F":
-        return decode(body, keys)
+        return decode(body, keys, zero_missing)
     if mode == b"E":
-        return _decode_encrypted(body, block_index, keys, expected)
+        return _decode_encrypted(body, block_index, keys, expected,
+                                 zero_missing)
     raise UnsupportedFormatError(f"unknown BLTE chunk mode {mode!r}")
 
 
@@ -189,8 +200,12 @@ def parse_header(data: bytes) -> tuple[int, list[ChunkInfo]]:
     return header_size, chunks
 
 
-def decode(data: bytes, keys=None) -> bytes:
-    """Decode a complete BLTE stream."""
+def decode(data: bytes, keys=None, zero_missing: bool = False) -> bytes:
+    """Decode a complete BLTE stream.
+
+    ``zero_missing`` turns chunks encrypted with an unknown key into zeros of
+    their declared size; see :func:`_decode_encrypted`.
+    """
     offset, chunks = parse_header(data)
     out = bytearray()
     pos = offset
@@ -201,7 +216,7 @@ def decode(data: bytes, keys=None) -> bytes:
         if size <= 0:
             break
         out += _decode_chunk(data[pos : pos + size], index, keys,
-                             chunk.decompressed_size)
+                             chunk.decompressed_size, zero_missing)
         pos += size
     return bytes(out)
 

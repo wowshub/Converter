@@ -1,8 +1,8 @@
 import struct
 
+import fixtures as F
 import pytest
 
-import fixtures as F
 from wotlkconv.chunks import ChunkReader
 from wotlkconv.errors import UnsupportedFormatError
 from wotlkconv.limits import MOMT_SIZE
@@ -69,6 +69,47 @@ def test_texture_file_ids_become_a_motx_table(wmo_root, listfile):
     for i in range(2):
         assert struct.unpack_from("<I", momt, i * MOMT_SIZE + 12)[0] in motx
     assert back.n_textures == 2
+
+
+def test_material_fields_are_read_at_the_smomaterial_offsets(wmo_root, listfile):
+    """texture_3 is at 0x24; 0x20 is the ground type and stays a number.  An
+    absent texture points at an empty name, as in 3.3.5a's own files, because
+    offset 0 is the first texture's name."""
+    out, _res, _ = convert_wmo_root(wmo_root, "t.wmo", Options(), listfile)
+    back = parse_root(out, "o.wmo")
+    blob = back.payload("MOTX")
+
+    def name_at(offset):
+        return blob[offset:blob.index(b"\0", offset)].decode("latin-1")
+
+    momt = back.payload("MOMT")
+    for i in range(2):
+        texture_2, _color, ground, texture_3 = struct.unpack_from(
+            "<4I", momt, i * MOMT_SIZE + 24)
+        assert ground == 10
+        assert name_at(texture_2) == ""
+        assert name_at(texture_3) == ("world\\wmo\\tex1.blp" if i else "")
+    assert "unknown\\10.blp" not in split_string_table(blob).values()
+
+
+def test_a_shader_23_material_keeps_its_diffuse_texture(wmo_root, listfile):
+    """Shader 23 leaves texture_1 empty and keeps the diffuse in texture_2,
+    and further texture ids in color_3/flags_3/runtime data.  Falling back to
+    diffuse, 3.3.5a reads texture_1 and takes those words for colour and
+    flags."""
+    raw = bytearray(wmo_root)
+    at = raw.index(b"TMOM") + 8 + MOMT_SIZE          # the second material
+    struct.pack_into("<3I", raw, at, 0, 23, 0)
+    struct.pack_into("<I", raw, at + 12, 0)
+    struct.pack_into("<I", raw, at + 24, 800002)
+    struct.pack_into("<4I", raw, at + 40, 800001, 800002, 7, 9)
+    out, res, _ = convert_wmo_root(bytes(raw), "t.wmo", Options(), listfile)
+    back = parse_root(out, "o.wmo")
+    blob, momt = back.payload("MOTX"), back.payload("MOMT")
+    texture_1, = struct.unpack_from("<I", momt, MOMT_SIZE + 12)
+    assert blob[texture_1:blob.index(b"\0", texture_1)] == b"world\\wmo\\tex2.blp"
+    assert momt[MOMT_SIZE + 40:2 * MOMT_SIZE] == bytes(24)
+    assert any(n.code == "wmo.material.texture_promoted" for n in res.notes)
 
 
 def test_doodad_file_ids_become_a_modn_table(wmo_root, listfile):
@@ -179,6 +220,151 @@ def test_extra_uv_and_colour_layers_are_dropped(opts):
     assert names.count("MOTV") == 2 and names.count("MOCV") == 2
     codes = {n.code for n in res.notes}
     assert {"wmo.group.uv_layers", "wmo.group.color_layers"} <= codes
+
+
+def test_second_uv_and_colour_layers_come_last(opts):
+    """3.3.5a's own groups, and Noggit, read the chunks in a fixed order; a
+    second MOTV straight after the first is read as MOBA, and Noggit fails the
+    group or crashes."""
+    raw = F.build_modern_wmo_group(uv_layers=2, colour_layers=2)
+    out, _res = convert_group(raw, "g.wmo", opts)
+    names = [n for n in group_subchunks(out) if n in ("MOTV", "MOBA", "MOCV", "MLIQ", "MOBN", "MOBR")]
+    assert names[:2] == ["MOTV", "MOBA"]
+    assert names[-2:] == ["MOTV", "MOCV"]
+    assert names.index("MOCV") < names.index("MOTV", 1)
+
+
+def _collision_group(with_moba: bool, uv_layers: int, vertices: int = 6) -> bytes:
+    """A group the way retail writes collision-only geometry."""
+    from wotlkconv.chunks import ChunkWriter
+    raw = F.build_modern_wmo_group(uv_layers=uv_layers, colour_layers=0,
+                                   wide_indices=False, wide_polys=False,
+                                   vertices=vertices)
+    top = list(ChunkReader(raw, reverse=True))
+    mogp = next(c.data for c in top if c.name == "MOGP")
+    inner = ChunkWriter(reverse=True)
+    for c in ChunkReader(mogp, reverse=True, start=68):
+        if c.name == "MOBA" and not with_moba:
+            continue
+        inner.add(c.name, c.data)
+    outer = ChunkWriter(reverse=True)
+    outer.add("MVER", struct.pack("<I", 17))
+    outer.add("MOGP", mogp[:68] + inner.getvalue())
+    return outer.getvalue()
+
+
+def test_a_group_always_has_the_chunks_readers_expect(opts):
+    """3.3.5a's groups always carry MOPY, MOVI, MOVT, MONR, MOTV and MOBA, in
+    that order; Noggit reads them unconditionally, so a missing MOTV or MOBA
+    makes it take the next chunk for it."""
+    out, _res = convert_group(_collision_group(with_moba=False, uv_layers=0), "g.wmo", opts)
+    names = group_subchunks(out)
+    assert names[:6] == ["MOPY", "MOVI", "MOVT", "MONR", "MOTV", "MOBA"]
+    subs = {c.name: c.data for c in ChunkReader(
+        next(c.data for c in ChunkReader(out, reverse=True) if c.name == "MOGP"),
+        reverse=True, start=68)}
+    assert subs["MOTV"] == bytes(8 * 6)          # zeroed, one pair per vertex
+    assert subs["MOBA"] == b""
+
+
+def _group_flags(out: bytes) -> int:
+    mogp = next(c.data for c in ChunkReader(out, reverse=True) if c.name == "MOGP")
+    return struct.unpack_from("<I", mogp, 8)[0]
+
+
+def _set_group_flags(raw: bytes, flags: int) -> bytes:
+    out = bytearray(raw)
+    mogp = next(c for c in ChunkReader(raw, reverse=True) if c.name == "MOGP")
+    struct.pack_into("<I", out, mogp.offset + 8, flags)
+    return bytes(out)
+
+
+def test_optional_chunk_flags_follow_what_is_written(opts):
+    """Retail keeps "has lights" (0x200) on 5,850 groups whose lights moved out
+    of MOLR; 3.3.5a reads a flagged chunk without checking its name."""
+    raw = F.build_modern_wmo_group()
+    raw = _set_group_flags(raw, 0x8 | 0x4 | 0x200 | 0x800 | 0x1000 | 0x400)
+    out, _res = convert_group(raw, "g.wmo", opts)
+    flags = _group_flags(out)
+    names = group_subchunks(out)
+    for tag, bit in (("MOLR", 0x200), ("MODR", 0x800), ("MLIQ", 0x1000),
+                     ("MOBN", 0x1), ("MPBV", 0x400)):
+        assert bool(flags & bit) == (tag in names), tag
+
+
+def test_a_group_without_a_collision_tree_gets_one(opts):
+    out, res = convert_group(F.build_modern_wmo_group(triangles=4), "g.wmo", opts)
+    subs = {c.name: c.data for c in ChunkReader(
+        next(c.data for c in ChunkReader(out, reverse=True) if c.name == "MOGP"),
+        reverse=True, start=68)}
+    assert _group_flags(out) & 0x1
+    faces = struct.unpack_from(f"<{len(subs['MOBR']) // 2}H", subs["MOBR"], 0)
+    assert sorted(set(faces)) == [0, 1, 2, 3]
+    assert any(n.code == "wmo.group.bsp_built" for n in res.notes)
+
+
+def test_material_count_follows_momt_not_texture_names(listfile):
+    """MOHD's first word is the MOMT entry count; materials sharing a texture
+    made the name count smaller, and readers sized the material array by it."""
+    raw = F.build_modern_wmo_root(materials=4, texture_ids=(800001,))
+    out, _res, _ = convert_wmo_root(raw, "t.wmo", Options(), listfile)
+    back = parse_root(out, "o.wmo")
+    assert back.n_textures == len(back.payload("MOMT")) // MOMT_SIZE == 4
+
+
+def _edit_root(raw: bytes, **replace) -> bytes:
+    """Rewrite a root's chunks: name -> new payload, or a callable on the old
+    one; names not present are appended."""
+    from wotlkconv.chunks import ChunkWriter
+    cw = ChunkWriter(reverse=True)
+    seen = set()
+    for chunk in ChunkReader(raw, reverse=True):
+        data = chunk.data
+        if chunk.name in replace:
+            new = replace[chunk.name]
+            data = new(data) if callable(new) else new
+            seen.add(chunk.name)
+        cw.add(chunk.name, data)
+    for name, new in replace.items():
+        if name not in seen:
+            cw.add(name, new)
+    return cw.getvalue()
+
+
+def _ambient_volume(colour: int, doodad_set: int = 0) -> bytes:
+    entry = bytearray(48)
+    struct.pack_into("<IIIIH", entry, 0x14, colour, 0, 0, 0, doodad_set)
+    return bytes(entry)
+
+
+def _set_mohd(offset: int, value: int):
+    def edit(mohd: bytes) -> bytes:
+        out = bytearray(mohd)
+        struct.pack_into("<I", out, offset, value)
+        return bytes(out)
+    return edit
+
+
+def test_doodad_count_follows_modd(listfile):
+    raw = _edit_root(F.build_modern_wmo_root(doodads=2), MOHD=_set_mohd(0x14, 5))
+    out, _res, _ = convert_wmo_root(raw, "t.wmo", Options(), listfile)
+    assert struct.unpack_from("<I", parse_root(out, "o.wmo").payload("MOHD"), 0x14)[0] == 2
+
+
+@pytest.mark.parametrize("header,mavg,mavd,written", [
+    # Retail keeps the colour in the default set's global volume, header black.
+    (0, _ambient_volume(0xFF101820, 1) + _ambient_volume(0xFF304050, 0), b"", 0xFF304050),
+    # With no global colour, a black header takes the first volume's.
+    (0, _ambient_volume(0), _ambient_volume(0xFF223344), 0xFF223344),
+    # A header colour is not replaced by a local volume or a black entry.
+    (0xFF808080, _ambient_volume(0), _ambient_volume(0xFF223344), 0xFF808080),
+])
+def test_ambient_colour_comes_from_the_ambient_volumes(listfile, header, mavg, mavd, written):
+    raw = _edit_root(F.build_modern_wmo_root(), MOHD=_set_mohd(0x1C, header),
+                     MAVG=mavg, MAVD=mavd)
+    out, res, _ = convert_wmo_root(raw, "t.wmo", Options(), listfile)
+    assert struct.unpack_from("<I", parse_root(out, "o.wmo").payload("MOHD"), 0x1C)[0] == written
+    assert any(n.code == "wmo.ambient" for n in res.notes) == (header == 0)
 
 
 def test_layer_flags_are_recomputed_to_match(opts):

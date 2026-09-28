@@ -76,4 +76,6 @@ def test_discover_returns_an_empty_listfile_rather_than_raising(tmp_path, monkey
 
 
 def test_placeholder_paths_are_deterministic():
-    assert placeholder_path(12345, "blp") == "unresolved\\blp\\12345.blp"
+    # The name a build writes a file with no listfile entry under, so a
+    # reference to one that is in the build still finds it.
+    assert placeholder_path(12345, "blp") == "unknown\\12345.blp"

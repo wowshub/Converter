@@ -44,11 +44,11 @@ class Image:
     data: bytearray
 
     @classmethod
-    def new(cls, width: int, height: int, fill: tuple[int, int, int, int] = (0, 0, 0, 0)) -> "Image":
+    def new(cls, width: int, height: int, fill: tuple[int, int, int, int] = (0, 0, 0, 0)) -> Image:
         return cls(width, height, bytearray(bytes(fill) * (width * height)))
 
     @classmethod
-    def from_rgba(cls, width: int, height: int, data: bytes | bytearray) -> "Image":
+    def from_rgba(cls, width: int, height: int, data: bytes | bytearray) -> Image:
         expected = width * height * 4
         buf = bytearray(data)
         if len(buf) < expected:
@@ -73,7 +73,7 @@ class Image:
     def is_opaque(self) -> bool:
         return min(self.data[3::4], default=255) == 255
 
-    def copy(self) -> "Image":
+    def copy(self) -> Image:
         return Image(self.width, self.height, bytearray(self.data))
 
     def to_bgra(self) -> bytearray:
@@ -82,14 +82,14 @@ class Image:
         return out
 
     @classmethod
-    def from_bgra(cls, width: int, height: int, data: bytes | bytearray) -> "Image":
+    def from_bgra(cls, width: int, height: int, data: bytes | bytearray) -> Image:
         img = cls.from_rgba(width, height, data)
         src = bytes(img.data)
         img.data[0::4], img.data[2::4] = src[2::4], src[0::4]
         return img
 
     # -- resampling -----------------------------------------------------
-    def halve(self) -> "Image":
+    def halve(self) -> Image:
         """2x2 box filter, the standard mip reduction.
 
         Degenerate levels (1xN or Nx1) only average along the axis that is
@@ -129,7 +129,7 @@ class Image:
                 di += 4
         return Image(nw, nh, dst)
 
-    def resize(self, width: int, height: int) -> "Image":
+    def resize(self, width: int, height: int) -> Image:
         """Area-average when shrinking, bilinear when growing."""
         if width == self.width and height == self.height:
             return self.copy()
@@ -137,7 +137,7 @@ class Image:
             return self._resize_box(width, height)
         return self._resize_bilinear(width, height)
 
-    def _resize_box(self, nw: int, nh: int) -> "Image":
+    def _resize_box(self, nw: int, nh: int) -> Image:
         w, h = self.width, self.height
         src = self.data
         dst = bytearray(nw * nh * 4)
@@ -169,7 +169,7 @@ class Image:
                 di += 4
         return Image(nw, nh, dst)
 
-    def _resize_bilinear(self, nw: int, nh: int) -> "Image":
+    def _resize_bilinear(self, nw: int, nh: int) -> Image:
         w, h = self.width, self.height
         src = self.data
         dst = bytearray(nw * nh * 4)
@@ -201,7 +201,7 @@ class Image:
                 di += 4
         return Image(nw, nh, dst)
 
-    def mip_chain(self, levels: int | None = None) -> list["Image"]:
+    def mip_chain(self, levels: int | None = None) -> list[Image]:
         """Full mip chain starting with this image, down to 1x1."""
         chain = [self]
         cur = self

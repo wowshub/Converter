@@ -88,7 +88,7 @@ def salsa20(key: bytes, nonce: bytes, data: bytes) -> bytes:
         chunk = data[offset : offset + 64]
         for i, byte in enumerate(chunk):
             out[offset + i] = byte ^ block[i]
-        counter += 1
+        counter += 1  # noqa: SIM113 -- cipher block counter, not an index
     return bytes(out)
 
 

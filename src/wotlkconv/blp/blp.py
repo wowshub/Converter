@@ -21,7 +21,7 @@ a straight copy of a modern texture fail on the old client.
 from __future__ import annotations
 
 import dataclasses
-from typing import Sequence
+from collections.abc import Sequence
 
 from ..binio import Reader, Writer
 from ..errors import MalformedFileError, UnsupportedFormatError
@@ -35,6 +35,16 @@ from ..limits import (
 )
 from . import bcn
 from .image import Image
+
+
+class EmptyTextureError(MalformedFileError):
+    """A well-formed BLP header that declares no image data at all.
+
+    Retail ships a few of these as placeholders (12.1 has 1,172-byte
+    minimap tiles: header and zeroed palette, every mip offset and size
+    zero).  There is nothing to convert, which is not the same thing as a
+    broken file.
+    """
 
 HEADER_SIZE = 1172
 MAGIC = b"BLP2"
@@ -114,7 +124,7 @@ class Blp:
 
     # -- parsing --------------------------------------------------------
     @classmethod
-    def parse(cls, data: bytes, name: str = "<memory>") -> "Blp":
+    def parse(cls, data: bytes, name: str = "<memory>") -> Blp:
         if len(data) < 8:
             raise MalformedFileError(f"{name}: too short to be a BLP")
         if data[:4] == MAGIC_BLP1:
@@ -155,6 +165,10 @@ class Blp:
             if max(1, width >> level) == 1 and max(1, height >> level) == 1:
                 break
         if not mips:
+            if not any(offsets) and not any(sizes):
+                raise EmptyTextureError(
+                    f"{name}: the texture declares no image data (every mip "
+                    f"offset and size is zero)")
             raise MalformedFileError(f"{name}: BLP has no mip levels")
 
         return cls(width, height, compression, alpha_size, alpha_type,
@@ -241,7 +255,7 @@ class Blp:
                     alpha_type: int = PreferredFormat.DXT5,
                     alpha_size: int = 8,
                     palette: Sequence[int] | None = None,
-                    payloads: Sequence[bytes] | None = None) -> "Blp":
+                    payloads: Sequence[bytes] | None = None) -> Blp:
         """Assemble a BLP from an already-encoded mip chain.
 
         ``payloads`` carries the encoded bytes per level; ``images`` is only

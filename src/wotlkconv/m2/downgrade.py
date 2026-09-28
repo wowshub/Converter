@@ -21,10 +21,10 @@ the user knows what changed.
 
 from __future__ import annotations
 
+import math
 import os
 
 from ..limits import (
-    M2_VERSION_NEWEST_KNOWN,
     M2_BLEND_MODE_FALLBACK,
     M2_BONE_FLAG_MASK,
     M2_DEFAULT_FOV,
@@ -35,18 +35,29 @@ from ..limits import (
     M2_MAX_PARTICLE_BLEND_MODE,
     M2_MAX_SKIN_PROFILES,
     M2_MAX_TEXTURE_TYPE,
+    M2_PACKED_GRAVITY_SCALE,
+    M2_PARTICLE_FLAG_COMPRESSED_GRAVITY,
     M2_PARTICLE_FLAG_MASK,
     M2_PARTICLE_FLAG_MULTI_TEXTURE,
+    M2_SEQUENCE_FLAG_MASK,
     M2_SOFT_MAX_BONES,
     M2_VERSION,
+    M2_VERSION_NEWEST_KNOWN,
 )
 from ..listfile import Listfile, normalise, placeholder_path
 from ..options import Options, UnresolvedPolicy
 from ..report import FileResult
 from ..resolve import AssetSource
 from . import schemas
-from .model import M2Model
+from .model import (
+    SEQUENCE_ALIAS_FLAG,
+    SEQUENCE_EMBEDDED_FLAG,
+    SEQUENCE_EMBEDDED_FLAGS,
+    M2Model,
+    external_sequences,
+)
 from .skel import Skeleton, load_skeleton_chain
+from .types import Track, mark_external
 
 #: Chunks whose loss is worth telling the user about, and why.
 NOTABLE_DROPPED_CHUNKS = {
@@ -81,14 +92,24 @@ def merge_skeleton(model: M2Model, skel: Skeleton, result: FileResult) -> None:
     if skel.bones and not model.bones:
         model.bones = skel.bones
         model.key_bone_lookup = skel.key_bone_lookup
+        model.bones_from_skeleton = True
     if skel.sequences and not model.sequences:
         model.sequences = skel.sequences
         model.sequence_lookups = skel.sequence_lookups
         model.sequence_schema = skel.sequence_schema
         model.global_loops = skel.global_loops or model.global_loops
+        # The model's own tracks -- colours, texture animation, particles --
+        # are indexed by these sequences too, but were read before they were
+        # known, so an external sub-array came out of the model at an offset
+        # into its .anim.
+        external = external_sequences(model.sequences, chunked=True)
+        if external:
+            for track in model.own_tracks():
+                mark_external(track, external)
     if skel.attachments and not model.attachments:
         model.attachments = skel.attachments
         model.attachment_lookup = skel.attachment_lookup
+        model.attachments_from_skeleton = True
     if skel.anim_file_ids and not model.anim_file_ids:
         model.anim_file_ids = skel.anim_file_ids
     result.info(
@@ -160,6 +181,11 @@ def _resolve_reference(file_id: int, kind: str, opts: Options, listfile: Listfil
     return path
 
 
+#: "Monster skin 1": filled from CreatureDisplayInfo on a creature, empty on
+#: anything else -- a texture slot with no file to load.
+EMPTY_REPLACEABLE_TEXTURE_TYPE = 11
+
+
 def resolve_textures(model: M2Model, opts: Options, listfile: Listfile,
                      result: FileResult) -> None:
     """Turn TXID FileDataIDs back into the inline filenames 3.3.5a reads."""
@@ -169,13 +195,24 @@ def resolve_textures(model: M2Model, opts: Options, listfile: Listfile,
         tex_type = tex.get("type", 0)
         tex["flags"] = tex.get("flags", 0) & 0x3  # wrap-x | wrap-y
 
+        file_id = ids[i] if i < len(ids) else 0
         if tex_type > M2_MAX_TEXTURE_TYPE:
-            result.lossy("m2.texture.type",
-                         f"texture {i} uses replaceable type {tex_type}, which "
-                         f"3.3.5a does not know; treated as a hardcoded texture",
-                         index=i, type=tex_type)
-            tex["type"] = 0
-            tex_type = 0
+            if file_id or tex.get("filename"):
+                result.lossy("m2.texture.type",
+                             f"texture {i} uses replaceable type {tex_type}, "
+                             f"which 3.3.5a does not know; treated as a "
+                             f"hardcoded texture, since it names a file",
+                             index=i, type=tex_type)
+                tex["type"] = tex_type = 0
+            else:
+                result.lossy("m2.texture.type",
+                             f"texture {i} uses replaceable type {tex_type} "
+                             f"(guild emblems, character extras), which 3.3.5a "
+                             f"does not know and nothing names a file for; made "
+                             f"a replaceable texture 3.3.5a leaves empty",
+                             index=i, type=tex_type)
+                tex["type"] = tex_type = EMPTY_REPLACEABLE_TEXTURE_TYPE
+                continue
 
         if tex.get("filename"):
             continue
@@ -184,11 +221,14 @@ def resolve_textures(model: M2Model, opts: Options, listfile: Listfile,
             # carry a filename in any expansion.
             continue
 
-        file_id = ids[i] if i < len(ids) else 0
         if not file_id:
+            # A hardcoded texture with an empty name makes the client and
+            # Noggit look up a file called "", which does not exist.
             result.lossy("m2.texture.missing",
                          f"texture {i} is a hardcoded texture with neither a "
-                         f"filename nor a FileDataID", index=i)
+                         f"filename nor a FileDataID; made a replaceable "
+                         f"texture 3.3.5a leaves empty", index=i)
+            tex["type"] = EMPTY_REPLACEABLE_TEXTURE_TYPE
             continue
         path = _resolve_reference(file_id, "blp", opts, listfile, result)
         if path is None:
@@ -253,6 +293,39 @@ def downgrade_cameras(model: M2Model, result: FileResult) -> None:
         result.info("m2.camera.fov", "camera FoV tracks flattened to scalars")
 
 
+def _unpack_gravity(track: Track) -> tuple[Track, int, int]:
+    """A packed-vector gravity track as the scalar one 3.3.5a reads.
+
+    Returns the new track, how many keys pulled sideways (which a scalar cannot
+    say), and how many sequences were dropped because their keys sit in an
+    ``.anim``.  A scalar ``g`` means the vector ``(0, 0, -g)``, so the scalar
+    is the negated vertical component of the unpacked vector.
+    """
+    out = Track(kind="f32", interpolation=track.interpolation,
+                global_sequence=track.global_sequence)
+    sideways = 0
+    in_anim = 0
+    for index, (stamps, values) in enumerate(zip(track.timestamps, track.values)):
+        if index in track.external:
+            in_anim += 1
+            out.timestamps.append([])
+            out.values.append([])
+            continue
+        floats = []
+        for x, y, z in values:
+            dx, dy = x / 128.0, y / 128.0
+            vertical = math.sqrt(max(0.0, 1.0 - dx * dx - dy * dy))
+            magnitude = z * M2_PACKED_GRAVITY_SCALE
+            if magnitude < 0:
+                vertical, magnitude = -vertical, -magnitude
+            if x or y:
+                sideways += 1
+            floats.append(-vertical * magnitude)
+        out.timestamps.append(list(stamps))
+        out.values.append(floats)
+    return out, sideways, in_anim
+
+
 def downgrade_particles(model: M2Model, opts: Options, result: FileResult) -> None:
     if opts.strip_particles and model.particles:
         result.lossy("m2.particle.stripped",
@@ -270,6 +343,7 @@ def downgrade_particles(model: M2Model, opts: Options, result: FileResult) -> No
     bad_emitter = 0
     clamped_blend = 0
     dropped_flags = 0
+    gravity_emitters = gravity_sideways = gravity_in_anim = 0
     out = []
     defaults = schemas.PARTICLE_264.defaults()
 
@@ -285,11 +359,20 @@ def downgrade_particles(model: M2Model, opts: Options, result: FileResult) -> No
             p["head_or_tail"] = 0
 
         flags = part.get("flags", 0)
+        if flags & M2_PARTICLE_FLAG_COMPRESSED_GRAVITY and "gravity" in part:
+            packed, sideways, in_anim = _unpack_gravity(part["gravity"])
+            p["gravity"] = packed
+            gravity_emitters += 1
+            gravity_sideways += bool(sideways)
+            gravity_in_anim += in_anim
         if flags & M2_PARTICLE_FLAG_MULTI_TEXTURE:
             multi_texture += 1
             # The texture field packs three 5-bit indices; keep the first.
             p["texture"] = part.get("texture", 0) & 0x1F
-        if flags & ~M2_PARTICLE_FLAG_MASK:
+        # The packed-gravity and multi-texture bits are handled above and
+        # reported on their own; any other bit past Wrath's is just lost.
+        if flags & ~(M2_PARTICLE_FLAG_MASK | M2_PARTICLE_FLAG_COMPRESSED_GRAVITY
+                     | M2_PARTICLE_FLAG_MULTI_TEXTURE):
             dropped_flags += 1
         p["flags"] = flags & M2_PARTICLE_FLAG_MASK
 
@@ -308,6 +391,25 @@ def downgrade_particles(model: M2Model, opts: Options, result: FileResult) -> No
     model.particles = out
     model.particle_schema = schemas.PARTICLE_264
 
+    if gravity_sideways or gravity_in_anim:
+        detail = []
+        if gravity_sideways:
+            detail.append(f"{gravity_sideways} pulled sideways as well as down, "
+                          f"and 3.3.5a's gravity is vertical only, so only the "
+                          f"vertical part was kept")
+        if gravity_in_anim:
+            detail.append(f"{gravity_in_anim} animation(s) kept their gravity keys "
+                          f"in an .anim, where they cannot be unpacked, so those "
+                          f"animations have none")
+        result.lossy("m2.particle.gravity",
+                     f"unpacked the vector gravity of {gravity_emitters} "
+                     f"emitter(s); " + "; ".join(detail),
+                     emitters=gravity_emitters)
+    elif gravity_emitters:
+        result.info("m2.particle.gravity",
+                    f"unpacked the vector gravity of {gravity_emitters} emitter(s) "
+                    f"into the plain downward pull 3.3.5a reads",
+                    emitters=gravity_emitters)
     if multi_texture:
         result.lossy("m2.particle.multitexture",
                      f"{multi_texture} emitter(s) used Cataclysm multi-texture "
@@ -357,6 +459,22 @@ def clamp_flags(model: M2Model, result: FileResult) -> None:
         result.info("m2.flags.global",
                     f"cleared post-Wrath global flags "
                     f"0x{original & ~M2_GLOBAL_FLAG_MASK:X}")
+
+    sequences_changed = 0
+    for seq in model.sequences:
+        f = seq.get("flags", 0)
+        masked = f
+        if f & SEQUENCE_EMBEDDED_FLAGS and not f & SEQUENCE_ALIAS_FLAG:
+            # Legion also says "in the model" with 0x100; Wrath only reads 0x20.
+            masked |= SEQUENCE_EMBEDDED_FLAG
+        masked &= M2_SEQUENCE_FLAG_MASK
+        if masked != f:
+            sequences_changed += 1
+            seq["flags"] = masked
+    if sequences_changed:
+        result.info("m2.flags.sequence",
+                    f"cleared post-Wrath flag bits on {sequences_changed} "
+                    f"sequence(s)", sequences=sequences_changed)
 
     bones_changed = 0
     for bone in model.bones:

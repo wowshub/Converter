@@ -7,14 +7,13 @@ nobody stated, and the assumption is worth stating.
 
 import struct
 
+import fixtures as F
 import pytest
 
-import fixtures as F
 from wotlkconv.adt.convert import AdtParts, convert_adt
 from wotlkconv.adt.wdl import convert_wdl
 from wotlkconv.adt.wdt import convert_wdt
-from wotlkconv.limits import (M2_VERSION_NEWEST_KNOWN, WMO_VERSION,
-                              WMO_VERSION_OLDEST_READABLE)
+from wotlkconv.limits import M2_VERSION_NEWEST_KNOWN, WMO_VERSION, WMO_VERSION_OLDEST_READABLE
 from wotlkconv.listfile import Listfile
 from wotlkconv.m2 import convert_m2
 from wotlkconv.options import Options

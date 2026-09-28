@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import dataclasses
 import struct
-from typing import Any, Iterable, Sequence
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 from ..binio import Writer
 
@@ -46,6 +47,9 @@ VALUE_FORMATS: dict[str, str] = {
     "splinevec3": "fffffffff",  # M2SplineKey<C3Vector>
     "u16x2": "HH",
     "u8x4": "BBBB",
+    # A particle gravity key when the emitter sets 0x800000: a direction's x
+    # and y in 1/128ths and a signed magnitude, in the float's four bytes.
+    "gravity_packed": "bbh",
 }
 
 #: Sizes of the container types themselves.
@@ -147,6 +151,47 @@ class TrackBase:
         self.external = {i for i in self.external if i < sequence_count}
 
 
+def mark_external(track: Track | TrackBase, indices: Iterable[int]) -> None:
+    """Settle, after reading, that these sequences live in an ``.anim``.
+
+    A track is often read before the sequence list that decides this is known
+    -- a model's own tracks before its skeleton is loaded, a skeleton's bones
+    before its parent's sequences.  Whatever was read at those offsets came
+    out of the wrong file, so it is thrown away; the spans themselves were
+    kept verbatim and are what gets written back.
+    """
+    values = getattr(track, "values", None)
+    for index in indices:
+        if index >= len(track.timestamp_spans):
+            continue
+        track.external.add(index)
+        if index < len(track.timestamps):
+            track.timestamps[index] = []
+        if values is not None and index < len(values):
+            values[index] = []
+
+
+def relocate_external(track: Track | TrackBase, indices: Iterable[int],
+                      delta: int) -> int:
+    """Move these external sequences' keyframe offsets by ``delta``.
+
+    Used when an ``.anim`` is flattened and a chunk's keyframes land ``delta``
+    bytes into the new file.  Empty sub-arrays keep whatever stale offset they
+    had.  Returns how many spans moved.
+    """
+    moved = 0
+    for spans in (track.timestamp_spans, getattr(track, "value_spans", None)):
+        if not spans:
+            continue
+        for index in indices:
+            if index in track.external and index < len(spans):
+                count, offset = spans[index]
+                if count:
+                    spans[index] = (count, offset + delta)
+                    moved += 1
+    return moved
+
+
 @dataclasses.dataclass(slots=True)
 class PartTrack:
     """``M2PartTrack<T>`` -- the flat FBlock used by particle emitters."""
@@ -188,8 +233,8 @@ class StructReader:
                 f"end of file ({len(self.data)})"
             )
         if _is_scalar(kind):
-            fmt = struct.Struct("<" + VALUE_FORMATS[kind] * count)
-            return list(fmt.unpack_from(self.data, offset))
+            return list(struct.unpack_from(f"<{count}{VALUE_FORMATS[kind]}",
+                                           self.data, offset))
         return [s.unpack_from(self.data, offset + i * s.size) for i in range(count)]
 
     def read_array(self, kind: str, pos: int) -> list[Any]:
@@ -267,7 +312,7 @@ class StructReader:
         return p
 
     # -- schema ---------------------------------------------------------
-    def read_struct(self, schema: "Schema", pos: int) -> dict[str, Any]:
+    def read_struct(self, schema: Schema, pos: int) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for name, kind, offset in schema.layout:
             p = pos + offset
@@ -339,10 +384,9 @@ class DeferredWriter(Writer):
                 self.raw(s.pack(*v))
 
     def write_string_array(self, pos: int, text: str) -> None:
-        if not text:
-            self.patch_u32(pos, 0)
-            self.patch_u32(pos + 4, 0)
-            return
+        # An empty name is still one NUL, as every genuine 3.3.5a model writes
+        # it (22,000 of them checked): a reader that follows the offset of a
+        # zero-length name without looking at the count lands on "MD20".
         payload = text.encode("latin-1") + b"\0"
         self.defer(pos, len(payload), lambda w: w.raw(payload))
 
@@ -352,7 +396,7 @@ class DeferredWriter(Writer):
         stamps = track.timestamps
         values = track.values
 
-        def emit_stamps(w: "DeferredWriter") -> None:
+        def emit_stamps(w: DeferredWriter) -> None:
             heads = [w.reserve_array() for _ in stamps]
             for i, (head, seq) in enumerate(zip(heads, stamps)):
                 span = track.span_for(i, track.timestamp_spans)
@@ -361,7 +405,7 @@ class DeferredWriter(Writer):
                 else:
                     w.write_array(head, "u32", seq)
 
-        def emit_values(w: "DeferredWriter") -> None:
+        def emit_values(w: DeferredWriter) -> None:
             heads = [w.reserve_array() for _ in values]
             for i, (head, seq) in enumerate(zip(heads, values)):
                 span = track.span_for(i, track.value_spans)
@@ -378,7 +422,7 @@ class DeferredWriter(Writer):
         self.patch_u16(pos + 2, track.global_sequence & 0xFFFF)
         stamps = track.timestamps
 
-        def emit_stamps(w: "DeferredWriter") -> None:
+        def emit_stamps(w: DeferredWriter) -> None:
             heads = [w.reserve_array() for _ in stamps]
             for i, (head, seq) in enumerate(zip(heads, stamps)):
                 span = track.span_for(i, track.timestamp_spans)
@@ -393,7 +437,7 @@ class DeferredWriter(Writer):
         self.write_array(pos, "u16", track.times)
         self.write_array(pos + M2ARRAY_SIZE, track.kind, track.values)
 
-    def write_struct(self, schema: "Schema", pos: int, values: dict[str, Any]) -> None:
+    def write_struct(self, schema: Schema, pos: int, values: dict[str, Any]) -> None:
         for name, kind, offset in schema.layout:
             p = pos + offset
             tag = kind[0]
@@ -420,7 +464,7 @@ class DeferredWriter(Writer):
             elif tag == "ptrk":
                 self.write_parttrack(p, value if value is not None else PartTrack(kind[1]))
 
-    def emit_struct(self, schema: "Schema", values: dict[str, Any]) -> int:
+    def emit_struct(self, schema: Schema, values: dict[str, Any]) -> int:
         """Append one struct's fixed part, patch it in place, return its offset."""
         pos = self.reserve(schema.size)
         self.write_struct(schema, pos, values)
@@ -458,7 +502,7 @@ def kind_size(kind: tuple) -> int:
 class Schema:
     """An ordered list of named fields with computed offsets."""
 
-    __slots__ = ("name", "fields", "layout", "size")
+    __slots__ = ("fields", "layout", "name", "size")
 
     def __init__(self, name: str, fields: Iterable[tuple[str, tuple]]):
         self.name = name

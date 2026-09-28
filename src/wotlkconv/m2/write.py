@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from ..limits import M2_GLOBAL_FLAG_USE_COMBINER_COMBOS, M2_MAGIC, M2_VERSION
 from . import schemas
-from .model import M2Model, VERTEX_SIZE
+from .model import VERTEX_SIZE, M2Model
 from .types import DeferredWriter, Schema
 
 

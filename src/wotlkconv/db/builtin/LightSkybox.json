@@ -1,0 +1,14 @@
+{
+  "table": "LightSkybox",
+  "description": "Skybox models. 3.3.5a names the model in Name; retail keeps it in SkyboxFileDataID and uses Name for a description.",
+  "columns": [
+    {
+      "target": [
+        "Name"
+      ],
+      "type": "string",
+      "resolve": "lightskybox.model",
+      "note": ".mdx path of SkyboxFileDataID; Name itself only when it is already a model path"
+    }
+  ]
+}

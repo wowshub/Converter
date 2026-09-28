@@ -30,8 +30,8 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Iterable, Iterator
 
 from .. import log
 from ..errors import MissingDependencyError
@@ -71,11 +71,16 @@ class Column:
     signed: bool = True
     array_size: int = 1
     is_id: bool = False
-    #: The value lives in the section's id list, not in the record.
+    #: The value is not stored in the record: the section's id list for an id,
+    #: the relationship map for a relation.
     non_inline: bool = False
-    #: The value lives in the relationship table.
+    #: A foreign key.  On its own (``$relation$``) it is an ordinary field in
+    #: the record; only with ``noninline`` does it live in the relationship map.
     relation: bool = False
     foreign_table: str = ""
+    #: Declared ``locstring``: one string per locale.  A WDC file stores just
+    #: the client's own; a pre-Cataclysm ``.dbc`` stores all of them.
+    localized: bool = False
 
     @property
     def is_string(self) -> bool:
@@ -99,7 +104,7 @@ class Layout:
 
     def inline_columns(self) -> list[Column]:
         """Columns that occupy a slot in the record itself."""
-        return [c for c in self.columns if not (c.non_inline or c.relation)]
+        return [c for c in self.columns if not c.non_inline]
 
     def by_name(self, name: str) -> Column | None:
         lowered = name.lower()
@@ -179,24 +184,31 @@ def parse_definition(text: str, name: str = "<dbd>") -> Definition:
                 m.group("type"), m.group("foreign") or "")
         index += 1
 
-    # -- LAYOUT blocks --------------------------------------------------
+    # -- definition blocks ----------------------------------------------
+    # Blocks are separated by blank lines.  Only builds from WDB6 on carry a
+    # LAYOUT hash; a DBC-era block -- every 3.3.5a table -- starts straight
+    # with its BUILD lines, and has to be a layout of its own rather than
+    # being folded into whichever block came before it.
     current: Layout | None = None
     while index < total:
         line = lines[index].strip()
         index += 1
         if not line:
+            current = None
             continue
-        if line.startswith("LAYOUT"):
-            current = Layout(hashes=[h.strip().upper()
-                                     for h in line[6:].split(",") if h.strip()])
-            definition.layouts.append(current)
+        if line.startswith(("COMMENT", "//")):
             continue
         if current is None:
+            if not line.startswith(("LAYOUT", "BUILD")):
+                continue
+            current = Layout()
+            definition.layouts.append(current)
+        if line.startswith("LAYOUT"):
+            current.hashes.extend(h.strip().upper()
+                                  for h in line[6:].split(",") if h.strip())
             continue
         if line.startswith("BUILD"):
             current.builds.extend(b.strip() for b in line[5:].split(",") if b.strip())
-            continue
-        if line.startswith(("COMMENT", "//")):
             continue
 
         m = _FIELD.match(line)
@@ -221,12 +233,13 @@ def parse_definition(text: str, name: str = "<dbd>") -> Definition:
             name=col_name,
             type=TYPE_MAP.get(declared_type, "int"),
             bit_width=bit_width,
-            signed=signed and declared_type not in ("uint",),
+            signed=signed and declared_type != "uint",
             array_size=int(m.group("array") or 1),
             is_id="id" in annotations,
             non_inline="noninline" in annotations,
             relation="relation" in annotations,
             foreign_table=foreign.split("::")[0] if foreign else "",
+            localized=declared_type == "locstring",
         ))
     return definition
 
@@ -245,7 +258,7 @@ class DbdIndex:
         return self.directory is not None and self.directory.is_dir()
 
     @classmethod
-    def discover(cls, explicit=None, search_dirs: Iterable = ()) -> "DbdIndex":
+    def discover(cls, explicit=None, search_dirs: Iterable = ()) -> DbdIndex:
         if explicit:
             index = cls(explicit)
             if not index:

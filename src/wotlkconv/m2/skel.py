@@ -16,15 +16,15 @@ from __future__ import annotations
 
 import dataclasses
 import struct
-from typing import Callable
+from collections.abc import Callable
 
 from ..chunks import Chunk, ChunkReader
 from ..errors import MalformedFileError, UnsupportedFormatError
 from . import schemas
-from .model import AnimFileRef, _read_structs
-from .types import Schema, StructReader
+from .model import AnimFileRef, _read_structs, external_sequences, tracks_in
+from .types import Schema, StructReader, mark_external
 
-KNOWN_SKEL_CHUNKS = {"SKL1", "SKA1", "SKB1", "SKS1", "SKPD", "SKPD", "AFID", "BFID"}
+KNOWN_SKEL_CHUNKS = {"SKL1", "SKA1", "SKB1", "SKS1", "SKPD", "AFID", "BFID"}
 
 
 @dataclasses.dataclass
@@ -45,7 +45,7 @@ class Skeleton:
     bone_file_ids: list[int] = dataclasses.field(default_factory=list)
     sequence_schema: Schema = schemas.SEQUENCE_272
 
-    def merge_parent(self, parent: "Skeleton") -> None:
+    def merge_parent(self, parent: Skeleton) -> None:
         """Fill in sections this skeleton does not define itself."""
         for field in ("bones", "key_bone_lookup", "attachments", "attachment_lookup",
                       "global_loops", "sequences", "sequence_lookups",
@@ -54,6 +54,21 @@ class Skeleton:
                 setattr(self, field, getattr(parent, field))
         if not self.name:
             self.name = parent.name
+
+    def settle_external(self) -> None:
+        """Mark the bone and attachment keyframes that live in ``.anim`` files.
+
+        The sequences decide, and a skeleton's sequences may come from its
+        parent, so this runs once the sections are final.  Until then an
+        external sub-array was read out of this file at an offset that means
+        something only inside the ``.anim`` -- and in a skeleton whose bone
+        chunk runs to megabytes, that offset almost always lands on bytes that
+        parse as keyframes instead of failing.
+        """
+        external = external_sequences(self.sequences, chunked=True)
+        if external:
+            for track in tracks_in(self.bones, self.attachments):
+                mark_external(track, external)
 
 
 def _candidate_views(whole: bytes, chunk: Chunk) -> list[bytes]:
@@ -141,6 +156,7 @@ def parse_skel(data: bytes, name: str = "<skel>") -> Skeleton:
         n = len(c.data) // 4
         skel.bone_file_ids = list(struct.unpack_from("<" + "I" * n, c.data, 0)) if n else []
 
+    skel.settle_external()
     return skel
 
 
@@ -168,4 +184,6 @@ def load_skeleton_chain(loader: Callable[[int], bytes | None], file_id: int,
             root.merge_parent(skel)
         current_id = skel.parent_skel_file_id
         depth += 1
+    if root is not None:
+        root.settle_external()
     return root

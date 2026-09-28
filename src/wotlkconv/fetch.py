@@ -29,6 +29,10 @@ from .errors import ConverterError
 LISTFILE_URL = ("https://github.com/wowdev/wow-listfile/releases/latest/"
                 "download/community-listfile.csv")
 
+#: Published TACT keys, for content that shipped encrypted and was later
+#: released.  Unreleased content stays encrypted whatever this holds.
+KEYS_URL = "https://raw.githubusercontent.com/wowdev/TACTKeys/master/WoW.txt"
+
 #: The column definitions, as a source archive so no git client is needed.
 DBDEFS_URL = "https://github.com/wowdev/WoWDBDefs/archive/refs/heads/master.zip"
 
@@ -75,6 +79,17 @@ def fetch_listfile(cache: Path | None = None, *, force: bool = False,
     dest = cache / "community-listfile.csv"
     if dest.is_file() and not force:
         log.info(f"using the cached listfile at {dest}")
+        return dest
+    return _download(url, dest)
+
+
+def fetch_keys(cache: Path | None = None, *, force: bool = False,
+               url: str = KEYS_URL) -> Path:
+    """The community TACT key list, downloaded once and reused after that."""
+    cache = Path(cache) if cache else default_cache()
+    dest = cache / "WoW.txt"
+    if dest.is_file() and not force:
+        log.info(f"using the cached TACT keys at {dest}")
         return dest
     return _download(url, dest)
 

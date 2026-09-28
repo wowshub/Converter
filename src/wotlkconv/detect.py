@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 
 from .chunks import ChunkReader
+from .liquid import SKIP_REASON as LIQUID_SKIP_REASON
 
 M2 = "m2"
 SKIN = "skin"
@@ -59,8 +60,7 @@ SKIP = "skip"         # cannot be used by 3.3.5a, or is handled elsewhere
 #: Kinds this tool converts. Client databases are handled separately: they
 #: need a definition, a mapping and usually the user's own table as a template,
 #: so they only join a `convert` run once --dbd is supplied.
-CONVERTIBLE = {M2, SKIN, ANIM, BLP, WMO_ROOT, WMO_GROUP, ADT, WDT, WDL,
-               LIQUID}
+CONVERTIBLE = {M2, SKIN, ANIM, BLP, WMO_ROOT, WMO_GROUP, ADT, WDT, WDL}
 
 #: Extensions the 3.3.5a client reads as-is. A patch archive needs these just
 #: as much as the converted files, so they are copied rather than dropped.
@@ -128,6 +128,9 @@ UNSUPPORTED_EXTENSIONS = {
             "that never reaches a retail client",
     ".blob": "a preload or index blob tied to the modern build's own "
              "FileDataIDs; meaningless to 3.3.5a",
+    ".wlw": LIQUID_SKIP_REASON,
+    ".wlm": LIQUID_SKIP_REASON,
+    ".wlq": LIQUID_SKIP_REASON,
 }
 
 #: What to do with a detected kind that is not converted, and why.  Detection
@@ -146,6 +149,7 @@ KIND_ACTIONS = {
     DDS: (SKIP, UNSUPPORTED_EXTENSIONS[".dds"]),
     PNG: (SKIP, UNSUPPORTED_EXTENSIONS[".png"]),
     TGA: (SKIP, UNSUPPORTED_EXTENSIONS[".tga"]),
+    LIQUID: (SKIP, LIQUID_SKIP_REASON),
 }
 
 #: Output extension for each kind.
@@ -172,8 +176,6 @@ CONVERTIBLE_EXTENSIONS = {
     ".skel": "a skeleton", ".blp": "a texture", ".wmo": "a world object",
     ".adt": "a terrain tile", ".wdt": "a map index",
     ".wdl": "a low-resolution heightmap", ".dbc": "a client database",
-    ".wlw": "a liquid volume", ".wlq": "a liquid volume",
-    ".wlm": "a liquid volume",
 }
 
 #: Files that sit beside a map's .wdt or .adt carrying data for systems that
@@ -192,7 +194,13 @@ MAP_SIDECAR_CHUNKS = {
     "MLHD": "the LOD terrain mesh (_lod.adt)",
     "MLVH": "the LOD terrain mesh (_lod.adt)",
     "MLLL": "the LOD terrain mesh (_lod.adt)",
+    "MMFE": "a model preload list (_preload.wdt)",
 }
+
+#: Sidecar chunks that sit beside a chunk a real map file also has, so they
+#: have to be looked for before the terrain test: a ``_preload.wdt`` is MVER,
+#: a 4-byte ``MHDR`` and ``MMFE`` (a real tile's MHDR is 64 bytes).
+_SIDECAR_BEFORE_TERRAIN = {"MMFE"}
 
 #: Suffixes of the terrain pieces a 3.3.5a tile has no room for, and why.
 UNUSED_ADT_PIECES = {
@@ -246,7 +254,7 @@ def _chunk_names(data: bytes, limit: int = 6) -> list[str]:
             names.append(chunk.name)
             if len(names) >= limit:
                 break
-    except Exception:  # noqa: BLE001 - detection must never raise
+    except Exception:
         pass
     return names
 
@@ -306,6 +314,8 @@ def detect(data: bytes, path: str = "") -> str:
             return WMO_ROOT
         if "MOGP" in names:
             return WMO_GROUP
+        if _SIDECAR_BEFORE_TERRAIN.intersection(names):
+            return MAP_SIDECAR
         if "MHDR" in names or "MCIN" in names or "MCNK" in names:
             return ADT
         if "MPHD" in names or "MAIN" in names:
@@ -318,7 +328,12 @@ def detect(data: bytes, path: str = "") -> str:
         if any(n in MAP_SIDECAR_CHUNKS for n in names):
             return MAP_SIDECAR
         if names[0] == "MVER" and len(names) == 1:
-            # MVER-only files are split ADT pieces whose payload chunks follow.
+            # A version and nothing else.  Retail ships these as empty map
+            # sidecars -- zulaman_fogs.wdt is 12 bytes: the map has no fog --
+            # so only an .adt is taken as a split terrain piece; routing a
+            # .wdt to the terrain converter failed ~2,000 of them per build.
+            if os.path.splitext(path)[1].lower() == ".wdt":
+                return MAP_SIDECAR
             return ADT
 
     ext = os.path.splitext(path)[1].lower()
@@ -393,7 +408,8 @@ def _sidecar_detail(path: str) -> str:
                            ("_occ", "terrain occlusion data"),
                            ("_fogs", "volumetric fog"),
                            ("_mpv", "particulate volumes"),
-                           ("_lod", "the LOD terrain mesh")):
+                           ("_lod", "the LOD terrain mesh"),
+                           ("_preload", "a list of models to preload")):
         if stem.endswith(suffix):
             return detail
     return "data added after Wrath"

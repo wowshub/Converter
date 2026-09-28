@@ -8,7 +8,7 @@ is what Blizzard's own BLP tooling produced.
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 
 def _box_split_channel(colours: Sequence[tuple[int, int, int]],
@@ -107,7 +107,7 @@ class PaletteMapper:
     work by two orders of magnitude with no visible difference.
     """
 
-    __slots__ = ("palette", "_cache")
+    __slots__ = ("_cache", "palette")
 
     def __init__(self, palette: Sequence[tuple[int, int, int]]):
         self.palette = list(palette)

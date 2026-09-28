@@ -8,8 +8,13 @@ from wotlkconv.errors import TruncatedFileError
 
 def test_reader_scalars_round_trip():
     w = Writer()
-    w.u8(0xFE); w.i8(-2); w.u16(0xBEEF); w.i16(-300)
-    w.u32(0xDEADBEEF); w.i32(-70000); w.f32(1.5)
+    w.u8(0xFE)
+    w.i8(-2)
+    w.u16(0xBEEF)
+    w.i16(-300)
+    w.u32(0xDEADBEEF)
+    w.i32(-70000)
+    w.f32(1.5)
     r = Reader(w.getvalue())
     assert r.u8() == 0xFE
     assert r.i8() == -2
@@ -23,7 +28,7 @@ def test_reader_scalars_round_trip():
 
 def test_reader_reports_the_file_that_ran_out():
     r = Reader(b"\x01\x02", name="broken.m2")
-    with pytest.raises(TruncatedFileError, match="broken.m2"):
+    with pytest.raises(TruncatedFileError, match=r"broken\.m2"):
         r.u32()
 
 

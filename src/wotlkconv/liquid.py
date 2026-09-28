@@ -1,112 +1,100 @@
-"""Liquid volumes -- ``.wlw`` and ``.wlm`` (and ``.wlq``, which the
-community listfile records none of, but which reads the same way).
+"""Liquid volumes -- ``.wlw``, ``.wlm`` and ``.wlq``.
 
-These sit beside a map and describe the lakes, rivers and lava the terrain's
-own liquid grid cannot: volumes with real shape, the ones the client tests
-against when deciding whether you are swimming.  3.3.5a reads all three, so
-unlike the LOD and lighting sidecars they belong in a patch.
+Retail ships a handful of these beside its maps, and **3.3.5a never loads
+them.**  It takes liquid from each terrain tile's ``MCLQ``/``MH2O`` and each
+world object's ``MLIQ``; none of its archives contains a liquid volume, and its
+executable has no file name pattern that could ask for one (it has the ones for
+``.adt`` and ``.wdt``).  So they are recognised -- by signature, since retail's
+are unnamed -- and skipped with that reason, never converted or copied.
 
-What this module does is narrower than a conversion, deliberately.  The header
-is well understood -- magic, version, liquid type, block count -- but the block
-layout that follows is not documented well enough to rewrite safely, and a
-liquid volume rewritten wrongly puts swimmable water where there is none.  So
-the version is checked and the body is passed through untouched:
+This module still reads the header, for ``inspect`` and for the report.  The
+layout below is proven on every liquid volume in 12.1.0.69814 (106 files) and
+MoP Classic 5.5.4 (1): each is exactly ``16 + 360 x blocks + 4 + 76 x
+secondary blocks + 1`` bytes, and a version 2 file with no blocks is a valid
+21 bytes.  Versions 0 and 1 are not present in any build or client available to
+check, so their trailing layout is not enforced.
 
-* a version 3.3.5a reads is already the file the old client wants, and is
-  copied byte for byte;
-* a newer one is refused by name, because a client that cannot parse the body
-  is worse off with the file than without it.
-
-If a build turns out to ship a version this refuses, that is the moment to
-work out the block layout -- and the report will say so explicitly rather than
-leaving a misparsed file to be discovered in-game.
+======  ======  =============================================================
+offset  type    field
+======  ======  =============================================================
+0x00    4s      magic ``*QIL`` (``LIQ*`` reversed; both are accepted)
+0x04    u16     version
+0x06    u16     unknown -- 1 in every real file
+0x08    u16     liquid type: a ``LiquidType`` row id
+0x0A    u16     padding
+0x0C    u32     block count, then 360-byte blocks
+..      u32     secondary block count, then 76-byte blocks
+..      u8      trailing byte (version 2)
+======  ======  =============================================================
 """
 
 from __future__ import annotations
 
+import dataclasses
 import struct
-import time
 
 from .errors import MalformedFileError, UnsupportedFormatError
-from .options import Options
-from .report import FileResult, Status
 
-#: The signature, in both byte orders.  Liquid files are not chunked, so the
-#: magic is written plainly -- but tools disagree about which way round it
-#: reads, and accepting both costs nothing and misidentifies nothing else.
+#: The signature, in both byte orders.
 LIQUID_MAGICS = (b"LIQ*", b"*QIL")
 
-#: Versions the 3.3.5a client parses.
-WOTLK_LIQUID_VERSIONS = (0, 1)
+HEADER = struct.Struct("<4sHHHHI")
+BLOCK_SIZE = 360
+SECONDARY_BLOCK_SIZE = 76
 
-HEADER_SIZE = 12
+#: Why no liquid volume goes into a 3.3.5a patch.
+SKIP_REASON = ("a liquid volume; 3.3.5a takes its liquid from each terrain "
+               "tile's MCLQ/MH2O and each world object's MLIQ, ships no liquid "
+               "volumes in any of its archives and has no file name to ask for "
+               "one, so it never loads the file")
 
-#: Smallest a block could conceivably be, used only to catch a count that
-#: cannot possibly fit in the file.
-MIN_BLOCK_SIZE = 8
+
+@dataclasses.dataclass(slots=True)
+class LiquidHeader:
+    version: int
+    liquid_type: int
+    blocks: int
+    secondary_blocks: int
+    #: Bytes after the secondary blocks; 1 in every real version 2 file.
+    trailing: int
 
 
-def parse_header(data: bytes, name: str = "<liquid>") -> tuple[int, int, int]:
-    """``(version, liquid_type, block_count)`` from a liquid volume."""
-    if len(data) < HEADER_SIZE:
+def parse_header(data: bytes, name: str = "<liquid>") -> LiquidHeader:
+    """Read a liquid volume's header and check its blocks fit the file."""
+    if len(data) < HEADER.size:
         raise MalformedFileError(
             f"{name}: file is {len(data)} bytes, too short for a liquid header")
-    if data[:4] not in LIQUID_MAGICS:
+    magic, version, _unknown, liquid_type, _pad, blocks = HEADER.unpack_from(data)
+    if magic not in LIQUID_MAGICS:
         raise UnsupportedFormatError(
-            f"{name}: not a liquid volume -- expected {LIQUID_MAGICS[0]!r}, "
-            f"found {data[:4]!r}")
-    version, liquid_type, blocks = struct.unpack_from("<HHI", data, 4)
-    if blocks and HEADER_SIZE + blocks * MIN_BLOCK_SIZE > len(data):
+            f"{name}: not a liquid volume -- expected {LIQUID_MAGICS[1]!r}, "
+            f"found {magic!r}")
+    pos = HEADER.size + blocks * BLOCK_SIZE
+    if pos + 4 > len(data):
         raise MalformedFileError(
-            f"{name}: header claims {blocks} liquid block(s), which cannot fit "
+            f"{name}: {blocks} liquid block(s) of {BLOCK_SIZE} bytes do not fit "
             f"in {len(data)} bytes")
-    return version, liquid_type, blocks
-
-
-def convert_liquid(data: bytes, source_name: str, opts: Options,
-                   result: FileResult | None = None) -> tuple[bytes, FileResult]:
-    """Check a liquid volume is one 3.3.5a can read, and pass it through."""
-    started = time.time()
-    res = result or FileResult(source=source_name, kind="liquid")
-    res.kind = "liquid"
-    res.bytes_in = len(data)
-
-    version, liquid_type, blocks = parse_header(data, source_name)
-    res.source_version = f"liquid v{version}"
-
-    if version not in WOTLK_LIQUID_VERSIONS:
-        res.fail("liquid.version",
-                 f"liquid volume version {version}; 3.3.5a reads "
-                 f"{' and '.join(str(v) for v in WOTLK_LIQUID_VERSIONS)}. The "
-                 f"block layout is not documented well enough to rewrite "
-                 f"safely, and a volume rewritten wrongly puts swimmable water "
-                 f"where there is none, so this file is refused rather than "
-                 f"copied")
-        res.elapsed = time.time() - started
-        return b"", res
-
-    res.status = Status.PASSTHROUGH
-    res.target_version = f"liquid v{version}"
-    res.bytes_out = len(data)
-    res.extra.update({"version": version, "liquid_type": liquid_type,
-                      "blocks": blocks})
-    res.info("liquid.compatible",
-             f"{blocks} liquid block(s), type {liquid_type}; version {version} "
-             f"is what 3.3.5a reads, so the file is used unchanged")
-    res.elapsed = time.time() - started
-    return data, res
+    secondary = struct.unpack_from("<I", data, pos)[0]
+    pos += 4 + secondary * SECONDARY_BLOCK_SIZE
+    if pos > len(data):
+        raise MalformedFileError(
+            f"{name}: {secondary} secondary liquid block(s) run past the end "
+            f"of the file")
+    return LiquidHeader(version, liquid_type, blocks, secondary, len(data) - pos)
 
 
 def inspect_liquid(data: bytes, source_name: str) -> dict:
     try:
-        version, liquid_type, blocks = parse_header(data, source_name)
+        header = parse_header(data, source_name)
     except (MalformedFileError, UnsupportedFormatError):
         return {"kind": "liquid", "readable": False, "bytes": len(data)}
     return {
         "kind": "liquid",
-        "version": version,
-        "liquid_type": liquid_type,
-        "blocks": blocks,
-        "reads_in_wotlk": version in WOTLK_LIQUID_VERSIONS,
+        "version": header.version,
+        "liquid_type": header.liquid_type,
+        "blocks": header.blocks,
+        "secondary_blocks": header.secondary_blocks,
+        "trailing_bytes": header.trailing,
+        "loaded_by_wotlk": False,
         "bytes": len(data),
     }

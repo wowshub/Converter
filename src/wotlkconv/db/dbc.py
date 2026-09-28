@@ -5,14 +5,19 @@ The format is as simple as the modern one is not::
     char   magic[4] = 'WDBC'
     uint32 record_count
     uint32 field_count
-    uint32 record_size      == field_count * 4
+    uint32 record_size      == the sum of the field widths
     uint32 string_block_size
     uint8  records[record_count][record_size]
     uint8  strings[string_block_size]
 
-Every field is four bytes. Nothing in the file says whether a field is an int,
-a float or an offset into the string block -- the client knows, and any tool
-has to be told.
+Nearly every field is four bytes, but not all: five of a 3.3.5a client's
+tables pack some columns into single bytes (CharBaseInfo, CharStartOutfit,
+PowerDisplay, SpellChainEffects, SpellItemEnchantmentCondition), and the
+header records only the total.  The definitions' widths reproduce the record
+size of every one of a clean client's 245 tables, so a caller that knows the
+layout passes ``field_sizes``; without it the four-byte layout is required.
+Nothing in the file says whether a field is an int, a float or an offset into
+the string block either -- the client knows, and any tool has to be told.
 
 That matters for merging. When new rows are appended to a table the user
 already has, this module **keeps the original records and string block byte for
@@ -46,12 +51,21 @@ class DbcTable:
     record_size: int = 0
     records: list[bytes] = dataclasses.field(default_factory=list)
     strings: bytes = b"\0"
+    #: Bytes per field, when not all four.
+    field_sizes: list[int] | None = None
 
     def __len__(self) -> int:
         return len(self.records)
 
+    def _slot(self, index: int) -> tuple[int, int]:
+        """``(byte offset, width)`` of field ``index`` within a record."""
+        if self.field_sizes is None:
+            return index * FIELD_SIZE, FIELD_SIZE
+        return sum(self.field_sizes[:index]), self.field_sizes[index]
+
     @classmethod
-    def parse(cls, data: bytes, name: str = "<dbc>") -> "DbcTable":
+    def parse(cls, data: bytes, name: str = "<dbc>",
+              field_sizes: list[int] | None = None) -> DbcTable:
         if len(data) < HEADER_SIZE:
             raise MalformedFileError(f"{name}: file is only {len(data)} bytes")
         if data[:4] != MAGIC:
@@ -59,7 +73,15 @@ class DbcTable:
                 f"{name}: not a 3.3.5a .dbc (magic {data[:4]!r})")
         record_count, field_count, record_size, string_size = struct.unpack_from(
             "<4I", data, 4)
-        if field_count and record_size != field_count * FIELD_SIZE:
+        if field_sizes is not None and all(s == FIELD_SIZE for s in field_sizes):
+            field_sizes = None
+        if field_sizes is not None:
+            if len(field_sizes) != field_count or sum(field_sizes) != record_size:
+                raise MalformedFileError(
+                    f"{name}: {field_count} fields in {record_size}-byte records "
+                    f"do not match the layout's {len(field_sizes)} fields in "
+                    f"{sum(field_sizes)} bytes")
+        elif field_count and record_size != field_count * FIELD_SIZE:
             raise MalformedFileError(
                 f"{name}: record size {record_size} does not match "
                 f"{field_count} four-byte fields")
@@ -69,7 +91,8 @@ class DbcTable:
             raise MalformedFileError(
                 f"{name}: {record_count} records of {record_size} bytes run "
                 f"past the end of the file")
-        table = cls(field_count=field_count, record_size=record_size)
+        table = cls(field_count=field_count, record_size=record_size,
+                    field_sizes=list(field_sizes) if field_sizes else None)
         table.records = [data[start + i * record_size:
                               start + (i + 1) * record_size]
                          for i in range(record_count)]
@@ -78,17 +101,19 @@ class DbcTable:
 
     # -- typed access ---------------------------------------------------
     def word(self, row: int, index: int) -> int:
-        return struct.unpack_from("<I", self.records[row], index * FIELD_SIZE)[0]
+        at, width = self._slot(index)
+        return int.from_bytes(self.records[row][at:at + width], "little")
 
     def value(self, row: int, index: int, kind: str) -> Any:
-        raw = self.records[row][index * FIELD_SIZE:(index + 1) * FIELD_SIZE]
+        at, width = self._slot(index)
+        raw = self.records[row][at:at + width]
         if kind == "float":
             return struct.unpack("<f", raw)[0]
         if kind == "int":
-            return struct.unpack("<i", raw)[0]
+            return int.from_bytes(raw, "little", signed=True)
         if kind == "string":
-            return self.string_at(struct.unpack("<I", raw)[0])
-        return struct.unpack("<I", raw)[0]
+            return self.string_at(int.from_bytes(raw, "little"))
+        return int.from_bytes(raw, "little")
 
     def string_at(self, offset: int) -> str:
         if offset <= 0 or offset >= len(self.strings):
@@ -119,11 +144,21 @@ class DbcBuilder:
     stays correct.
     """
 
-    def __init__(self, field_count: int, template: DbcTable | None = None):
+    def __init__(self, field_count: int, template: DbcTable | None = None,
+                 field_sizes: list[int] | None = None):
         if field_count <= 0:
             raise ValueError("a .dbc needs at least one field")
+        if field_sizes is not None and all(s == FIELD_SIZE for s in field_sizes):
+            field_sizes = None
+        if field_sizes is not None and len(field_sizes) != field_count:
+            raise ValueError(f"{len(field_sizes)} field sizes for "
+                             f"{field_count} fields")
         self.field_count = field_count
-        self.record_size = field_count * FIELD_SIZE
+        self.field_sizes = list(field_sizes) if field_sizes else None
+        self._offsets = ([sum(field_sizes[:i]) for i in range(field_count)]
+                         if field_sizes else
+                         [i * FIELD_SIZE for i in range(field_count)])
+        self.record_size = sum(field_sizes) if field_sizes else field_count * FIELD_SIZE
         self.template = template
         if template is not None:
             if template.field_count != field_count:
@@ -131,6 +166,10 @@ class DbcBuilder:
                     f"template has {template.field_count} fields but the "
                     f"mapping describes {field_count}; one of them is wrong "
                     f"for this client build")
+            if template.record_size != self.record_size:
+                raise MalformedFileError(
+                    f"template records are {template.record_size} bytes but "
+                    f"the layout's fields add up to {self.record_size}")
             self.records: list[bytearray] = [bytearray(r) for r in template.records]
             self._strings = bytearray(template.strings or b"\0")
         else:
@@ -155,10 +194,14 @@ class DbcBuilder:
     # -- rows -----------------------------------------------------------
     def index_existing(self, id_index: int = 0) -> None:
         """Note where each existing row's id lives, so rows can be replaced."""
+        at, width = self._offsets[id_index], self._width(id_index)
         for position, record in enumerate(self.records):
-            if len(record) >= (id_index + 1) * FIELD_SIZE:
-                row_id = struct.unpack_from("<I", record, id_index * FIELD_SIZE)[0]
+            if len(record) >= at + width:
+                row_id = int.from_bytes(record[at:at + width], "little")
                 self._row_index[row_id] = position
+
+    def _width(self, index: int) -> int:
+        return self.field_sizes[index] if self.field_sizes else FIELD_SIZE
 
     def encode(self, values: dict[int, tuple[str, Any]]) -> bytearray:
         """Pack ``{field index: (type, value)}`` into one record."""
@@ -168,15 +211,21 @@ class DbcBuilder:
                 raise MalformedFileError(
                     f"field index {index} is outside the table's "
                     f"{self.field_count} fields")
-            at = index * FIELD_SIZE
+            at, width = self._offsets[index], self._width(index)
+            if kind in ("float", "string") and width != FIELD_SIZE:
+                raise MalformedFileError(
+                    f"field {index} is {width} byte(s) wide, which cannot hold "
+                    f"a {kind}")
             if kind == "float":
                 struct.pack_into("<f", record, at, float(value))
             elif kind == "string":
                 struct.pack_into("<I", record, at, self.intern(str(value)))
-            elif kind == "int":
-                struct.pack_into("<i", record, at, int(value))
             else:
-                struct.pack_into("<I", record, at, int(value) & 0xFFFFFFFF)
+                # Same bits either way: a modern unsigned column holding a
+                # value past 2^31 lands in a Wrath column the client reads as
+                # signed, and a byte column keeps the low byte.
+                bits = int(value) & ((1 << (8 * width)) - 1)
+                record[at:at + width] = bits.to_bytes(width, "little")
         return record
 
     def add(self, values: dict[int, tuple[str, Any]], row_id: int | None = None,
@@ -184,7 +233,8 @@ class DbcBuilder:
         """Append a row, or replace one with the same id. Returns True if new."""
         record = self.encode(values)
         if row_id is None:
-            row_id = struct.unpack_from("<I", record, id_index * FIELD_SIZE)[0]
+            at, width = self._offsets[id_index], self._width(id_index)
+            row_id = int.from_bytes(record[at:at + width], "little")
         existing = self._row_index.get(row_id)
         if existing is not None and replace:
             self.records[existing] = record
@@ -198,7 +248,8 @@ class DbcBuilder:
 
     def build(self) -> DbcTable:
         table = DbcTable(field_count=self.field_count,
-                         record_size=self.record_size)
+                         record_size=self.record_size,
+                         field_sizes=self.field_sizes)
         table.records = [bytes(r) for r in self.records]
         table.strings = bytes(self._strings)
         return table

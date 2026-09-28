@@ -23,7 +23,7 @@ class TextureFormat(str, Enum):
 class UnresolvedPolicy(str, Enum):
     #: Abort the file when a FileDataID has no listfile entry.
     FAIL = "fail"
-    #: Write a deterministic ``unresolved/<kind>/<id>.<ext>`` path instead.
+    #: Write a deterministic ``unknown/<id>.<ext>`` path instead.
     PLACEHOLDER = "placeholder"
     #: Drop the reference entirely (texture slot becomes empty).
     STRIP = "strip"

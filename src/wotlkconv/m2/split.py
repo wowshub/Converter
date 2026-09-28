@@ -23,7 +23,7 @@ import struct
 from ..limits import M2_MAX_VERTICES
 from ..options import Options
 from ..report import FileResult
-from .model import M2Model, VERTEX_SIZE
+from .model import VERTEX_SIZE, M2Model
 from .skin import Skin
 
 #: M2SkinSection field offsets. ``Level`` is not a LOD number: it carries the
@@ -252,7 +252,7 @@ def split_model(model: M2Model, skins: dict[int, Skin], opts: Options,
             piece.events = []
 
         rebuilt = _rebuild_skin(base, submesh_indices, remap)
-        piece_skins = {index: rebuilt for index in sorted(skins)}
+        piece_skins = dict.fromkeys(sorted(skins), rebuilt)
         parts.append(ModelPart(piece, piece_skins,
                                "" if number == 0 else f"_part{number}",
                                len(used)))

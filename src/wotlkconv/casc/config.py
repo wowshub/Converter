@@ -69,9 +69,12 @@ class BuildInfo:
     encoding_ekey: str = ""
     install_ckey: str = ""
     build_name: str = ""
+    #: Where the install downloads from, for files it does not store.
+    cdn_hosts: list[str] = dataclasses.field(default_factory=list)
+    cdn_path: str = ""
 
     @classmethod
-    def load(cls, install_dir: Path, product: str | None = None) -> "BuildInfo":
+    def load(cls, install_dir: Path, product: str | None = None) -> BuildInfo:
         """Read ``.build.info`` and the build config it points at."""
         info_path = install_dir / ".build.info"
         if not info_path.is_file():
@@ -103,6 +106,8 @@ class BuildInfo:
             version=chosen.get("Version", ""),
             build_key=chosen.get("Build Key", ""),
             cdn_key=chosen.get("CDN Key", ""),
+            cdn_hosts=chosen.get("CDN Hosts", "").split(),
+            cdn_path=chosen.get("CDN Path", ""),
         )
 
         data_dir = install_dir / "Data"

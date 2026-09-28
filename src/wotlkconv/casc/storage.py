@@ -25,12 +25,15 @@ rather than discovered as a pile of failures afterwards.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import os
 import struct
 from pathlib import Path
 
 from .. import log
 from ..errors import MalformedFileError, MissingDependencyError
 from . import blte
+from .cdn import CdnSource, Fetcher
 from .config import BuildInfo
 from .encoding import EncodingTable
 from .index import ARCHIVE_ENTRY_HEADER, LocalIndex
@@ -103,11 +106,17 @@ class CascStorage:
         self.locale_name = locale_name
         self._handles: dict[int, object] = {}
         self._data_dir = install_dir / "Data" / "data"
+        #: Set to fetch what the install does not store; see :mod:`.cdn`.
+        self.cdn: CdnSource | None = None
 
     # -- construction ---------------------------------------------------
     @classmethod
     def open(cls, install_dir: str | Path, *, product: str | None = None,
-             locale: str = "enus", keys: KeyRing | None = None) -> "CascStorage":
+             locale: str = "enus", keys: KeyRing | None = None,
+             cdn_cache: str | os.PathLike[str] | None = None,
+             cdn_fetch: Fetcher | None = None) -> CascStorage:
+        """Open an install.  With ``cdn_cache``, files it does not store are
+        fetched from Blizzard's CDN, verified, and kept in that directory."""
         install_dir = Path(install_dir)
         keys = keys or KeyRing()
         build = BuildInfo.load(install_dir, product)
@@ -126,6 +135,8 @@ class CascStorage:
 
         storage = cls(install_dir, build, index, EncodingTable(), RootTable(),
                       keys, locale)
+        if cdn_cache is not None:
+            storage.cdn = CdnSource(install_dir, build, cdn_cache, cdn_fetch)
 
         raw = storage._read_by_ekey(bytes.fromhex(build.encoding_ekey), "encoding")
         storage.encoding = EncodingTable.parse(raw, "encoding")
@@ -153,13 +164,17 @@ class CascStorage:
             self._handles[number] = handle
         return handle
 
-    def _read_by_ekey(self, ekey: bytes, what: str = "file") -> bytes:
+    def _read_by_ekey(self, ekey: bytes, what: str = "file",
+                      zero_encrypted: bool = False) -> bytes:
         entry = self.index.find(ekey)
         if entry is None:
+            if self.cdn is not None:
+                return blte.decode(self.cdn.read(ekey, what), self.keys,
+                                   zero_encrypted)
             raise FileNotInstalledError(
                 f"{what} {ekey.hex()[:18]} is not in the local index; this "
                 f"install streams it from the CDN rather than storing it "
-                f"on disk")
+                f"on disk (--casc-cdn fetches it)")
         handle = self._archive(entry.archive)
         handle.seek(entry.offset)
         raw = handle.read(entry.size)
@@ -169,14 +184,25 @@ class CascStorage:
         declared = struct.unpack_from("<I", raw, 16)[0]
         if declared and declared <= len(raw):
             raw = raw[:declared]
-        return blte.decode(raw[ARCHIVE_ENTRY_HEADER:], self.keys)
+        return blte.decode(raw[ARCHIVE_ENTRY_HEADER:], self.keys,
+                           zero_encrypted)
 
-    def read_by_ckey(self, ckey: bytes, what: str = "file") -> bytes:
+    def read_by_ckey(self, ckey: bytes, what: str = "file",
+                     zero_encrypted: bool = False) -> bytes:
         ekey = self.encoding.ekey_for(ckey)
         if ekey is None:
             raise FileNotInstalledError(
                 f"{what} {ckey.hex()[:16]} has no entry in the encoding table")
-        return self._read_by_ekey(ekey, what)
+        from_cdn = self.cdn is not None and self.index.find(ekey) is None
+        data = self._read_by_ekey(ekey, what, zero_encrypted)
+        # A fetched file has already matched its encoding key; the content has
+        # to match its content key too.  Not checkable when encrypted parts
+        # were zeroed, which is the point of zeroing them.
+        if from_cdn and not zero_encrypted and hashlib.md5(data).digest() != ckey:
+            raise MalformedFileError(
+                f"{what}: the file fetched from the CDN decodes to content "
+                f"that does not match its content key {ckey.hex()[:16]}")
+        return data
 
     # -- public ---------------------------------------------------------
     def __contains__(self, file_id: int) -> bool:
@@ -185,18 +211,25 @@ class CascStorage:
     def file_ids(self):
         return self.root.file_ids()
 
-    def read_file_id(self, file_id: int) -> bytes:
-        """Read one file. Raises on missing, not-installed or encrypted."""
+    def read_file_id(self, file_id: int, zero_encrypted: bool = False) -> bytes:
+        """Read one file. Raises on missing, not-installed or encrypted.
+
+        ``zero_encrypted`` reads a file whose encrypted parts cannot be
+        decrypted anyway, with those parts zeroed -- for client databases,
+        whose unreleased rows sit in sections of their own that the reader
+        skips.  Anything else with a hole in it is simply corrupt.
+        """
         ckey = self.root.ckey_for(file_id)
         if ckey is None:
             raise MissingDependencyError(
                 f"FileDataID {file_id} is not in this build's root table")
-        return self.read_by_ckey(ckey, f"FileDataID {file_id}")
+        return self.read_by_ckey(ckey, f"FileDataID {file_id}", zero_encrypted)
 
-    def try_read_file_id(self, file_id: int) -> tuple[bytes | None, str]:
+    def try_read_file_id(self, file_id: int, zero_encrypted: bool = False
+                         ) -> tuple[bytes | None, str]:
         """Read a file, returning ``(data, "")`` or ``(None, reason)``."""
         try:
-            return self.read_file_id(file_id), ""
+            return self.read_file_id(file_id, zero_encrypted), ""
         except blte.EncryptedChunkError as exc:
             return None, str(exc)
         except (MissingDependencyError, MalformedFileError) as exc:
@@ -244,8 +277,10 @@ class CascStorage:
         for handle in self._handles.values():
             handle.close()  # type: ignore[attr-defined]
         self._handles.clear()
+        if self.cdn is not None:
+            self.cdn.close()
 
-    def __enter__(self) -> "CascStorage":
+    def __enter__(self) -> CascStorage:
         return self
 
     def __exit__(self, *_exc) -> None:

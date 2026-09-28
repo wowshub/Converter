@@ -3,9 +3,9 @@
 import random
 import struct
 
+import fixtures as F
 import pytest
 
-import fixtures as F
 from wotlkconv.chunks import ChunkReader
 from wotlkconv.limits import MOGI_SIZE, MOGP_HEADER_SIZE, WMO_MAX_GROUP_VERTICES
 from wotlkconv.listfile import Listfile
@@ -226,7 +226,7 @@ def build_model_with_skins(model_vertices: int, submesh_lists, asset_dir,
 def test_unused_geometry_is_dropped_rather_than_failing(listfile, source,
                                                         asset_dir):
     raw = build_model_with_skins(
-        70000, [list(range(0, 15000)), list(range(15000, 30000))], asset_dir)
+        70000, [list(range(15000)), list(range(15000, 30000))], asset_dir)
     out, res, companions = convert_m2(raw, "big.m2", Options(), listfile,
                                       source, output_stem="big")
     assert res.ok

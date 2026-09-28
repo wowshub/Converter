@@ -1,14 +1,17 @@
-"""Liquid volumes: 3.3.5a reads them, so they belong in a patch."""
+"""Liquid volumes: recognised, read, and left out of a 3.3.5a patch.
 
-import pytest
+3.3.5a takes its liquid from terrain and world-object chunks; none of its
+archives holds a liquid volume and its executable has no name to ask for one.
+"""
+
+import struct
 
 import fixtures as F
-from wotlkconv.detect import LIQUID, classify, detect
+import pytest
+
+from wotlkconv.detect import LIQUID, SKIP, classify, detect
 from wotlkconv.errors import MalformedFileError, UnsupportedFormatError
-from wotlkconv.liquid import (WOTLK_LIQUID_VERSIONS, convert_liquid,
-                              inspect_liquid, parse_header)
-from wotlkconv.options import Options
-from wotlkconv.report import Status
+from wotlkconv.liquid import inspect_liquid, parse_header
 
 
 def test_a_liquid_volume_is_recognised_without_a_name():
@@ -16,57 +19,59 @@ def test_a_liquid_volume_is_recognised_without_a_name():
 
 
 def test_the_other_byte_order_is_recognised_too():
-    """Tools disagree about which way the signature reads."""
-    assert detect(F.build_liquid(magic=b"*QIL"), "") == LIQUID
+    assert detect(F.build_liquid(magic=b"LIQ*"), "") == LIQUID
 
 
-def test_a_liquid_volume_is_converted_not_merely_copied():
-    assert classify(LIQUID, "world/maps/az/az.wlw")[0] == "convert"
+@pytest.mark.parametrize("path", ["unknown/5336174.wlw", "world/maps/az/az.wlw",
+                                  "a.wlm", "a.wlq"])
+def test_a_liquid_volume_is_skipped_saying_the_client_never_loads_it(path):
+    action, reason = classify(LIQUID, path)
+    assert action == SKIP and "never loads" in reason
 
 
-@pytest.mark.parametrize("version", WOTLK_LIQUID_VERSIONS)
-def test_a_version_wrath_reads_is_used_unchanged(version):
-    source = F.build_liquid(version=version, blocks=3)
-    out, res = convert_liquid(source, "az.wlw", Options())
-    assert out == source
-    assert res.status is Status.PASSTHROUGH
-    assert res.extra["blocks"] == 3 and res.extra["version"] == version
-    assert any(n.code == "liquid.compatible" for n in res.notes)
+def test_a_liquid_name_on_other_bytes_gets_the_same_reason():
+    action, reason = classify("unknown", "world/maps/az/az.wlw")
+    assert action == SKIP and "never loads" in reason
 
 
-def test_a_newer_version_is_refused_rather_than_shipped():
-    """Water in the wrong place is worse than no water."""
-    out, res = convert_liquid(F.build_liquid(version=5), "az.wlw", Options())
-    assert res.status is Status.FAILED and out == b""
-    message = next(n.message for n in res.notes if n.level == "error")
-    assert "version 5" in message and "3.3.5a reads" in message
+def test_the_header_is_read_as_retail_lays_it_out():
+    header = parse_header(F.build_liquid(liquid_type=81, blocks=3), "a.wlw")
+    assert (header.version, header.liquid_type, header.blocks) == (2, 81, 3)
+    assert header.secondary_blocks == 0 and header.trailing == 1
 
 
-def test_the_liquid_type_is_carried_into_the_report():
-    _out, res = convert_liquid(F.build_liquid(liquid_type=7), "az.wlw",
-                               Options())
-    assert res.extra["liquid_type"] == 7
+def test_an_empty_volume_is_valid_not_malformed():
+    # 21 retail files are exactly this: the old reader took liquid type 5 for
+    # a block count and called them "5 blocks that cannot fit in 21 bytes".
+    empty = b"*QIL" + struct.pack("<HHHHI", 2, 1, 5, 0, 0) + struct.pack("<I", 0) + b"\x01"
+    assert len(empty) == 21
+    header = parse_header(empty, "unknown/5336173.wlw")
+    assert (header.blocks, header.liquid_type, header.trailing) == (0, 5, 1)
 
 
-def test_a_file_that_is_not_a_liquid_volume_says_so():
-    with pytest.raises(UnsupportedFormatError, match="not a liquid volume"):
-        convert_liquid(b"NOPE" + b"\0" * 16, "az.wlw", Options())
+def test_secondary_blocks_are_accounted_for():
+    header = parse_header(F.build_liquid(blocks=1, secondary=2), "a.wlw")
+    assert header.secondary_blocks == 2 and header.trailing == 1
+
+
+def test_blocks_that_do_not_fit_are_refused():
+    truncated = F.build_liquid(blocks=3)[:16 + 360]
+    with pytest.raises(MalformedFileError, match="do not fit"):
+        parse_header(truncated, "a.wlw")
 
 
 def test_a_truncated_header_is_malformed():
     with pytest.raises(MalformedFileError, match="too short"):
-        parse_header(b"LIQ*\x01\x00", "az.wlw")
+        parse_header(b"*QIL\x02\x00", "a.wlw")
 
 
-def test_a_block_count_that_cannot_fit_is_refused():
-    """Catches truncation without claiming to know the block layout."""
-    claims_many = F.build_liquid(blocks=2)[:12].replace(
-        b"\x02\x00\x00\x00", b"\xff\xff\x00\x00") + b"\0" * 32
-    with pytest.raises(MalformedFileError, match="cannot fit"):
-        parse_header(claims_many, "az.wlw")
+def test_a_file_that_is_not_a_liquid_volume_says_so():
+    with pytest.raises(UnsupportedFormatError, match="not a liquid volume"):
+        parse_header(b"NOPE" + b"\0" * 32, "a.wlw")
 
 
-def test_inspect_reports_whether_the_old_client_can_read_it():
-    assert inspect_liquid(F.build_liquid(version=1), "a.wlw")["reads_in_wotlk"]
-    assert not inspect_liquid(F.build_liquid(version=9), "a.wlw")["reads_in_wotlk"]
+def test_inspect_describes_the_volume():
+    info = inspect_liquid(F.build_liquid(liquid_type=350, blocks=2), "a.wlw")
+    assert info["liquid_type"] == 350 and info["blocks"] == 2
+    assert info["loaded_by_wotlk"] is False
     assert inspect_liquid(b"junk", "a.wlw")["readable"] is False

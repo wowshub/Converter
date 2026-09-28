@@ -11,15 +11,15 @@ from __future__ import annotations
 
 import struct
 
-from wotlkconv.chunks import ChunkWriter
 from wotlkconv.blp import bcn
 from wotlkconv.blp.blp import Blp, PreferredFormat
 from wotlkconv.blp.image import Image
+from wotlkconv.chunks import ChunkWriter
+from wotlkconv.limits import SKIN_MAGIC
 from wotlkconv.m2 import schemas
 from wotlkconv.m2.model import M2Model
 from wotlkconv.m2.types import DeferredWriter, PartTrack, Track
 from wotlkconv.m2.write import write_md20
-from wotlkconv.limits import SKIN_MAGIC
 
 # M2 chunk magics are stored in reading order, unlike ADT/WMO.
 M2_CHUNKS_FORWARD = False
@@ -42,9 +42,9 @@ def make_track(kind: str, sequences: int, keys_per_sequence: int = 2,
                 vals.append((0.0, 0.0, 0.0, 1.0))
             elif kind == "f32":
                 vals.append(float(i))
-            elif kind in ("u8",):
+            elif kind == "u8":
                 vals.append(i & 0xFF)
-            elif kind in ("u16",):
+            elif kind == "u16":
                 vals.append(i)
             elif kind == "fixed16":
                 vals.append(32767)
@@ -128,7 +128,7 @@ def build_modern_model(*, sequences: int = 2, bones: int = 3, vertices: int = 6,
     m.vertex_count = vertices
     m.num_skin_profiles = 4
 
-    for i in range(textures):
+    for _ in range(textures):
         t = schemas.TEXTURE.defaults()
         # Legion leaves the filename empty and names the texture in TXID.
         t.update(type=0, flags=3, filename="")
@@ -181,7 +181,7 @@ def build_modern_model(*, sequences: int = 2, bones: int = 3, vertices: int = 6,
     ev["enabled"].timestamps = [[0] for _ in range(sequences)]
     m.events.append(ev)
 
-    for i in range(lights):
+    for _ in range(lights):
         li = schemas.LIGHT.defaults()
         li.update(type=1, bone=0, position=(0.0, 0.0, 1.0),
                   ambient_color=make_track("vec3", sequences),
@@ -228,8 +228,9 @@ def build_modern_model(*, sequences: int = 2, bones: int = 3, vertices: int = 6,
     for i in range(particles):
         p = part_schema.defaults()
         p.update(particle_id=i,
-                 # 0x10000000 is the Cataclysm multi-texture emitter flag.
-                 flags=0x10000000 | 0x1,
+                 # 0x10000000 is the Cataclysm multi-texture emitter flag and
+                 # 0x4000000 a later one ("do not throttle emission").
+                 flags=0x10000000 | 0x4000000 | 0x1,
                  position=(0.0, 0.0, 1.0), bone=0,
                  texture=(3 | (4 << 5) | (5 << 10)),
                  blending_type=4,
@@ -307,7 +308,7 @@ def build_skin(*, vertices: int = 6, triangles: int = 2, submeshes: int = 1,
             "<10H3f3ff", i, 0, 0, vertices, 0, triangles * 3, 4, 0, 4, 0,
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0))
     batch_blobs = []
-    for i in range(batches):
+    for _ in range(batches):
         batch_blobs.append(struct.pack(
             "<BbHHHHHHHHHHH", 0, 0, shader_id, 0, 0, 0, 0, 0,
             texture_count, 0, 0, 0, 0))
@@ -338,7 +339,7 @@ def build_skin(*, vertices: int = 6, triangles: int = 2, submeshes: int = 1,
     head += struct.pack("<II", len(batch_blobs), offsets["batches"])
     head += struct.pack("<I", 4)
     if legion:
-        head += struct.pack("<II", shadow_batches if shadow_batches else 0,
+        head += struct.pack("<II", shadow_batches or 0,
                             offsets.get("shadow", 0))
     assert len(head) == header_size, (len(head), header_size)
     return bytes(head) + bytes(payload)
@@ -347,14 +348,20 @@ def build_skin(*, vertices: int = 6, triangles: int = 2, submeshes: int = 1,
 # ---------------------------------------------------------------------------
 # ANIM
 # ---------------------------------------------------------------------------
-def build_anim(payload: bytes = b"\x01\x02\x03\x04" * 8, *,
-               chunked: bool = True) -> bytes:
+def build_anim(payload: bytes | None = b"\x01\x02\x03\x04" * 8, *,
+               chunked: bool = True, afsb: bytes | None = b"\0" * 8,
+               afsa: bytes | None = b"\0" * 16) -> bytes:
+    """A Legion .anim: ``payload`` is AFM2, ``afsb``/``afsa`` the skeleton's
+    bone and attachment keyframes.  ``None`` leaves a chunk out."""
     if not chunked:
         return payload
     cw = ChunkWriter(reverse=M2_CHUNKS_FORWARD)
-    cw.add("AFM2", payload)
-    cw.add("AFSA", b"\0" * 16)
-    cw.add("AFSB", b"\0" * 8)
+    if payload is not None:
+        cw.add("AFM2", payload)
+    if afsa is not None:
+        cw.add("AFSA", afsa)
+    if afsb is not None:
+        cw.add("AFSB", afsb)
     return cw.getvalue()
 
 
@@ -362,8 +369,26 @@ def build_anim(payload: bytes = b"\x01\x02\x03\x04" * 8, *,
 # SKEL
 # ---------------------------------------------------------------------------
 def build_skel(*, bones: int = 3, sequences: int = 2, attachments: int = 1,
-               parent_id: int = 0, name: str = "TestSkeleton") -> bytes:
-    """A Legion .skel carrying bones, sequences and attachments."""
+               parent_id: int = 0, name: str = "TestSkeleton",
+               external_sequence: int | None = None, external_offset: int = 16,
+               track_sequences: int | None = None, anim_ids=()) -> bytes:
+    """A Legion .skel carrying bones, sequences and attachments.
+
+    ``external_sequence`` flags that sequence as kept in an ``.anim`` and
+    points every bone's translation keys for it at ``external_offset`` -- by
+    default an offset that also lands inside this file, as real ones do.
+    ``track_sequences`` sizes the tracks when the sequences live in a parent.
+    """
+    if track_sequences is None:
+        track_sequences = sequences
+
+    def track(kind: str, **kwargs) -> Track:
+        """A track with no keys of its own for the external sequence."""
+        t = make_track(kind, track_sequences, **kwargs)
+        if external_sequence is not None:
+            t.timestamps[external_sequence] = []
+            t.values[external_sequence] = []
+        return t
     def section(fields) -> bytes:
         """Write ``fields`` as leading M2Arrays with payloads after them."""
         w = DeferredWriter(alignment=4)
@@ -385,17 +410,22 @@ def build_skel(*, bones: int = 3, sequences: int = 2, attachments: int = 1,
     bone_items = []
     for i in range(bones):
         b = schemas.BONE.defaults()
+        translation = (
+            make_track("vec3", track_sequences) if external_sequence is None
+            else external_track("vec3", track_sequences, external_sequence,
+                                external_offset))
         b.update(key_bone_id=-1 if i else 0, flags=0x200, parent_bone=i - 1,
-                 translation=make_track("vec3", sequences),
-                 rotation=make_track("quat16", sequences),
-                 scale=make_track("vec3", sequences, value=(1.0, 1.0, 1.0)),
+                 translation=translation,
+                 rotation=track("quat16"),
+                 scale=track("vec3", value=(1.0, 1.0, 1.0)),
                  pivot=(0.0, 0.0, float(i)))
         bone_items.append(b)
 
     seq_items = []
     for i in range(sequences):
         s = schemas.SEQUENCE_272.defaults()
-        s.update(id=i, duration=500 + i, movespeed=1.0, flags=0x20,
+        s.update(id=i, duration=500 + i, movespeed=1.0,
+                 flags=0x00 if i == external_sequence else 0x20,
                  frequency=32767, blend_time_in=100, blend_time_out=200,
                  bounds_min=(-1.0,) * 3, bounds_max=(1.0,) * 3,
                  bounds_radius=1.7, variation_next=-1)
@@ -405,7 +435,7 @@ def build_skel(*, bones: int = 3, sequences: int = 2, attachments: int = 1,
     for i in range(attachments):
         a = schemas.ATTACHMENT.defaults()
         a.update(id=i, bone=0, position=(0.0, 0.0, 1.0),
-                 animate_attached=make_track("u8", sequences))
+                 animate_attached=track("u8"))
         att_items.append(a)
 
     skl1 = DeferredWriter(alignment=4)
@@ -427,6 +457,9 @@ def build_skel(*, bones: int = 3, sequences: int = 2, attachments: int = 1,
                             ("u16", [])]))
     if parent_id:
         cw.add("SKPD", struct.pack("<8sI4s", b"\0" * 8, parent_id, b"\0" * 4))
+    if anim_ids:
+        cw.add("AFID", b"".join(struct.pack("<HHI", a, s, f)
+                                for a, s, f in anim_ids))
     return cw.getvalue()
 
 
@@ -514,7 +547,8 @@ def build_modern_wmo_root(*, groups: int = 2, materials: int = 2,
                          8 if i else 2)      # blend 8 does not exist either
         struct.pack_into("<I", momt, base + 12, texture_ids[i % len(texture_ids)])
         struct.pack_into("<I", momt, base + 24, 0)
-        struct.pack_into("<I", momt, base + 32, 0)
+        struct.pack_into("<I", momt, base + 32, 10)   # ground type, not a texture
+        struct.pack_into("<I", momt, base + 36, texture_ids[0] if i else 0)
     cw.add("MOMT", bytes(momt))
 
     cw.add("MOGN", _pad4(b"".join(f"Group{i}".encode() + b"\0" for i in range(groups))))
@@ -611,9 +645,14 @@ def build_modern_wmo_group(*, vertices: int = 6, triangles: int = 2,
 # ---------------------------------------------------------------------------
 def build_split_adt(*, chunks: int = 4, layers: int = 2,
                     texture_ids=(700001, 700002), doodad_refs: int = 3,
-                    object_refs: int = 2, high_res_holes: bool = True
+                    object_refs: int = 2, high_res_holes: bool = True,
+                    doodad_ids=None, wmo_ids=None
                     ) -> tuple[bytes, bytes, bytes]:
-    """A Cataclysm-style split tile: (root, tex0, obj0)."""
+    """A Cataclysm-style split tile: (root, tex0, obj0).
+
+    ``doodad_ids``/``wmo_ids`` build the BfA-and-later obj0 instead: no name
+    tables, and one placement per FileDataID with the FileDataID flag set.
+    """
     rev = WMO_CHUNKS_REVERSED
 
     # -- root -----------------------------------------------------------
@@ -626,12 +665,15 @@ def build_split_adt(*, chunks: int = 4, layers: int = 2,
 
     for i in range(chunks):
         hdr = bytearray(128)
-        flags = 0x0
+        flags = 0x1 | 0x40   # retail keeps these set with no MCSH to go with them
         if high_res_holes:
             flags |= 0x10000
-            # 8x8 mask: punch the top-left 2x2 high-res quadrant only.
-            hdr[0x40] = 0b00000011
-            hdr[0x41] = 0b00000011
+            # 8x8 mask where the MCVT/MCNR offsets were: punch the top-left
+            # 2x2 high-res quadrant only.
+            hdr[0x14] = 0b00000011
+            hdr[0x15] = 0b00000011
+        # The low-quality texture map, which a split root still carries.
+        hdr[0x40:0x50] = bytes(range(0xA0, 0xB0))
         struct.pack_into("<I", hdr, 0, flags)
         struct.pack_into("<II", hdr, 4, i % 16, i // 16)
         struct.pack_into("<I", hdr, 0x34, 1519)                  # area id
@@ -667,12 +709,28 @@ def build_split_adt(*, chunks: int = 4, layers: int = 2,
     # -- obj0 -----------------------------------------------------------
     obj = ChunkWriter(reverse=rev)
     obj.add("MVER", struct.pack("<I", 18))
-    obj.add("MMDX", b"world\\doodad\\tree.m2\0")
-    obj.add("MMID", struct.pack("<I", 0))
-    obj.add("MWMO", b"world\\wmo\\house.wmo\0")
-    obj.add("MWID", struct.pack("<I", 0))
-    obj.add("MDDF", bytes(36))
-    obj.add("MODF", bytes(64))
+    if doodad_ids is None and wmo_ids is None:
+        obj.add("MMDX", b"world\\doodad\\tree.m2\0")
+        obj.add("MMID", struct.pack("<I", 0))
+        obj.add("MWMO", b"world\\wmo\\house.wmo\0")
+        obj.add("MWID", struct.pack("<I", 0))
+        obj.add("MDDF", bytes(36))
+        obj.add("MODF", bytes(64))
+    else:
+        mddf = bytearray()
+        for uid, file_id in enumerate(doodad_ids or ()):
+            entry = bytearray(36)
+            struct.pack_into("<II3f", entry, 0, file_id, uid, float(uid), 0.0, 0.0)
+            struct.pack_into("<HH", entry, 32, 1024, 0x40 | 0x1)
+            mddf += entry
+        modf = bytearray()
+        for uid, file_id in enumerate(wmo_ids or ()):
+            entry = bytearray(64)
+            struct.pack_into("<II", entry, 0, file_id, 1000 + uid)
+            struct.pack_into("<4H", entry, 56, 0x8 | 0x1, 0, 0, 1024)
+            modf += entry
+        obj.add("MDDF", bytes(mddf))
+        obj.add("MODF", bytes(modf))
     for _ in range(chunks):
         inner = ChunkWriter(reverse=rev)
         inner.add("MCRD", struct.pack("<" + "I" * doodad_refs,
@@ -684,12 +742,45 @@ def build_split_adt(*, chunks: int = 4, layers: int = 2,
     return root.getvalue(), tex.getvalue(), obj.getvalue()
 
 
+def build_mh2o(instances) -> bytes:
+    """An MH2O payload from ``{chunk, type, field, lo, hi, x, y, w, h, bitmap,
+    vertices, attributes}`` dicts, laid out the way retail packs it: headers,
+    then each chunk's instance table and attributes, then its data blocks."""
+    by_chunk: dict[int, list[dict]] = {}
+    for spec in instances:
+        by_chunk.setdefault(spec["chunk"], []).append(spec)
+    out = bytearray(256 * 12)
+    for chunk, specs in sorted(by_chunk.items()):
+        table_at = len(out)
+        out += bytes(24 * len(specs))
+        attributes = specs[0].get("attributes", b"")
+        attributes_at = len(out) if attributes else 0
+        out += attributes
+        struct.pack_into("<III", out, chunk * 12, table_at, len(specs), attributes_at)
+        for k, spec in enumerate(specs):
+            bitmap_at = len(out) if spec.get("bitmap") else 0
+            out += spec.get("bitmap", b"")
+            vertices_at = len(out) if spec.get("vertices") else 0
+            out += spec.get("vertices", b"")
+            struct.pack_into("<HHffBBBBII", out, table_at + k * 24, spec["type"],
+                             spec["field"], spec.get("lo", 0.0), spec.get("hi", 0.0),
+                             spec.get("x", 0), spec.get("y", 0), spec["w"], spec["h"],
+                             bitmap_at, vertices_at)
+    return bytes(out)
+
+
 # ---------------------------------------------------------------------------
 # WDT
 # ---------------------------------------------------------------------------
 def build_modern_wdt(*, tiles=((32, 48), (33, 48)), flags: int = 0x0201,
-                     global_wmo: bool = False, with_maid: bool = True) -> bytes:
-    """A BfA-shaped map index: MAID present, big-alpha flag absent."""
+                     global_wmo: bool = False, with_maid: bool = True,
+                     global_wmo_id: int | None = None) -> bytes:
+    """A BfA-shaped map index: MAID present, big-alpha flag absent.
+
+    ``global_wmo_id`` places the map's WMO the way retail does now: by
+    FileDataID, with no MWMO chunk at all.
+    """
+    global_wmo = global_wmo or global_wmo_id is not None
     cw = ChunkWriter(reverse=WMO_CHUNKS_REVERSED)
     cw.add("MVER", struct.pack("<I", 18))
 
@@ -705,9 +796,15 @@ def build_modern_wdt(*, tiles=((32, 48), (33, 48)), flags: int = 0x0201,
 
     if with_maid:
         cw.add("MAID", bytes(64 * 64 * 8 * 4))
-    cw.add("MWMO", b"world\\wmo\\global.wmo\0" if global_wmo else b"")
-    if global_wmo:
-        cw.add("MODF", bytes(64))
+    if global_wmo_id is not None:
+        modf = bytearray(64)
+        struct.pack_into("<I", modf, 0, global_wmo_id)
+        struct.pack_into("<4H", modf, 56, 0x8, 0, 0, 1024)
+        cw.add("MODF", bytes(modf))
+    else:
+        cw.add("MWMO", b"world\\wmo\\global.wmo\0" if global_wmo else b"")
+        if global_wmo:
+            cw.add("MODF", bytes(64))
     cw.add("MPL2", bytes(24))
     return cw.getvalue()
 
@@ -894,11 +991,19 @@ def build_wdl(*, tiles=((0, 0), (32, 48)), holes: bool = True,
 # ---------------------------------------------------------------------------
 # Liquid volumes
 # ---------------------------------------------------------------------------
-def build_liquid(*, version: int = 1, liquid_type: int = 2, blocks: int = 2,
-                 magic: bytes = b"LIQ*", block_size: int = 64) -> bytes:
-    """A .wlw/.wlq liquid volume: a 12-byte header and opaque blocks."""
+def build_liquid(*, version: int = 2, liquid_type: int = 5, blocks: int = 2,
+                 magic: bytes = b"*QIL", secondary: int = 0,
+                 trailing: bytes = b"\x01") -> bytes:
+    """A .wlw liquid volume laid out as every retail 12.1 one is.
+
+    16-byte header (magic, version, an unknown 1, liquid type, padding, block
+    count), 360-byte blocks, a secondary block count and 76-byte blocks, then
+    one trailing byte.
+    """
     out = bytearray(magic)
-    out += struct.pack("<HHI", version, liquid_type, blocks)
+    out += struct.pack("<HHHHI", version, 1, liquid_type, 0, blocks)
     for i in range(blocks):
-        out += bytes([(i + 1) & 0xFF]) * block_size
-    return bytes(out)
+        out += bytes([(i + 1) & 0xFF]) * 360
+    out += struct.pack("<I", secondary)
+    out += bytes(76 * secondary)
+    return bytes(out) + trailing

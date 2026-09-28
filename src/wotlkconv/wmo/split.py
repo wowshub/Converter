@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import struct
-from typing import Sequence
+from collections.abc import Sequence
 
 from ..limits import WMO_MAX_GROUP_VERTICES
 from .bsp import build_bsp

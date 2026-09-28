@@ -56,6 +56,10 @@ MODERN_ROOT_CHUNKS = {
     "MOPB": "prepass batches",
     "MOQG": "query face flags",
     "MOSB2": "secondary skybox",
+    "MGI2": "group LOD assignments",
+    "MOPE": "extra portal data",
+    "MDDL": "detail doodad layers",
+    "MOLV": "light direction volumes",
 }
 
 #: The chunks that were actually reachable in ``ALL_KNOWN`` for auto-detection.

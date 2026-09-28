@@ -9,12 +9,17 @@ Only local installs are read; nothing is fetched from Blizzard's CDN, and
 ``CascStorage.coverage`` reports how much of the build that leaves readable.
 """
 
-from .blte import EncryptedChunkError, decode as blte_decode
+from .blte import EncryptedChunkError
+from .blte import decode as blte_decode
 from .keys import KeyRing
-from .storage import (CascStorage, Coverage, FileNotInstalledError,
-                      StorageStats)
+from .storage import CascStorage, Coverage, FileNotInstalledError, StorageStats
 
 __all__ = [
-    "CascStorage", "KeyRing", "StorageStats", "Coverage",
-    "EncryptedChunkError", "FileNotInstalledError", "blte_decode",
+                      "CascStorage",
+                      "Coverage",
+                      "EncryptedChunkError",
+                      "FileNotInstalledError",
+                      "KeyRing",
+                      "StorageStats",
+                      "blte_decode",
 ]

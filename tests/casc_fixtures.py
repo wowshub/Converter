@@ -100,27 +100,46 @@ def make_encoding(entries: dict[bytes, tuple[bytes, int]], *,
 # ---------------------------------------------------------------------------
 def make_root(entries: dict[int, bytes], *, mfst: bool = True,
               locale_flags: int = 0xFFFFFFFF, content_flags: int = 0x10000000,
-              version2: bool = False, with_names: bool = False) -> bytes:
-    """``{file_id: ckey}`` -> a root table."""
-    ids = sorted(entries)
+              header_version: int = 0, with_names: bool = False) -> bytes:
+    """``{file_id: ckey}`` -> a root table with one block."""
+    flags = content_flags if not with_names else (content_flags & ~0x10000000)
+    return make_root_blocks([(entries, flags, locale_flags)], mfst=mfst,
+                            header_version=header_version)
+
+
+def make_root_blocks(blocks: list[tuple[dict[int, bytes], int, int]], *,
+                     mfst: bool = True, header_version: int = 0) -> bytes:
+    """``[({file_id: ckey}, content_flags, locale_flags), ...]`` -> a root.
+
+    ``header_version`` 0 writes the 8.2 ``TSFM`` header with no size/version
+    prefix; 1 writes the 10.1.7 prefix; 2 also switches every block to the
+    17-byte ``records, locale, flags1, flags2, flags3`` header of 11.1+.
+    """
+    total = sum(len(entries) for entries, _c, _l in blocks)
     out = bytearray()
     if mfst:
         out += b"TSFM"
-        if version2:
-            out += struct.pack("<IIIII", 0x18, 2, len(ids), 0, 0)
+        if header_version:
+            out += struct.pack("<IIIII", 0x18, header_version, total, 0, 0)
         else:
-            out += struct.pack("<II", len(ids), 0)
+            out += struct.pack("<II", total, 0)
 
-    flags = content_flags if not with_names else (content_flags & ~0x10000000)
-    out += struct.pack("<III", len(ids), flags, locale_flags)
-    previous = -1
-    for file_id in ids:
-        out += struct.pack("<i", file_id - previous - 1)
-        previous = file_id
-    for file_id in ids:
-        out += entries[file_id]
-    if with_names:
-        out += bytes(8 * len(ids))
+    for entries, content_flags, locale_flags in blocks:
+        ids = sorted(entries)
+        if header_version == 2:
+            out += struct.pack("<IIIIB", len(ids), locale_flags,
+                               content_flags & 0x0FFFFFFF,
+                               content_flags & 0xF0000000, 0)
+        else:
+            out += struct.pack("<III", len(ids), content_flags, locale_flags)
+        previous = -1
+        for file_id in ids:
+            out += struct.pack("<i", file_id - previous - 1)
+            previous = file_id
+        for file_id in ids:
+            out += entries[file_id]
+        if not content_flags & 0x10000000:
+            out += bytes(8 * len(ids))
     return bytes(out)
 
 
@@ -154,18 +173,86 @@ def make_index(bucket: int, entries: dict[bytes, tuple[int, int, int]]) -> bytes
 # ---------------------------------------------------------------------------
 # Whole install
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CDN
+# ---------------------------------------------------------------------------
+CDN_HOSTS = ("cdn-a.test", "cdn-b.test")
+CDN_PATH = "tpr/wow"
+
+
+def blte_ekey(stream: bytes) -> bytes:
+    """An encoding key: MD5 of the BLTE header, or of a headerless stream."""
+    header_size = struct.unpack_from(">I", stream, 4)[0]
+    return md5(stream[:header_size] if header_size else stream)
+
+
+def make_cdn_index(entries: list[tuple[bytes, int, int, int]],
+                   offset_bytes: int) -> bytes:
+    """``[(ekey, size, archive, offset)]`` -> a CDN ``.index``.
+
+    4 KiB blocks of sorted ``key, size (BE), offset (BE)`` entries, then a table
+    of each block's last key and an 8-byte block hash, then the 28-byte footer.
+    ``offset_bytes`` is 6 for an archive-group index (2-byte archive number),
+    4 for one archive's index and 0 for the loose-file index.
+    """
+    entry_len = 16 + 4 + offset_bytes
+    per_block = 4096 // entry_len
+    ordered = sorted(entries)
+    blocks = [ordered[i:i + per_block] for i in range(0, len(ordered), per_block)] or [[]]
+    body, last_keys, hashes = bytearray(), bytearray(), bytearray()
+    for block in blocks:
+        raw = bytearray()
+        for ekey, size, archive, offset in block:
+            raw += ekey + size.to_bytes(4, "big")
+            if offset_bytes == 6:
+                raw += archive.to_bytes(2, "big") + offset.to_bytes(4, "big")
+            elif offset_bytes == 4:
+                raw += offset.to_bytes(4, "big")
+        raw = raw.ljust(4096, b"\0")
+        body += raw
+        last_keys += block[-1][0] if block else bytes(16)
+        hashes += md5(raw)[:8]
+    toc = bytes(last_keys) + bytes(hashes)
+    footer = (md5(toc)[:8] + bytes([1, 0, 0, 4, offset_bytes, 4, 16, 8])
+              + struct.pack("<I", len(entries)))
+    footer += md5(footer)[:8]
+    return bytes(body) + toc + footer
+
+
+def serve_cdn(root_dir: Path, *, corrupt_hosts: set[str] = frozenset(),
+              dead_hosts: set[str] = frozenset(), log: list | None = None):
+    """A fetcher that answers from the ``cdn/`` tree ``build_install`` wrote."""
+    def fetch(url: str, offset: int | None, size: int) -> bytes:
+        host, _, rest = url.removeprefix("http://").partition("/")
+        if log is not None:
+            log.append((host, rest, offset, size))
+        if host in dead_hosts:
+            raise OSError(f"{host} is unreachable")
+        data = (root_dir / "cdn" / rest).read_bytes()
+        data = data if offset is None else data[offset:offset + size]
+        if host in corrupt_hosts:
+            data = data[:8] + bytes(len(data) - 8)
+        return data
+    return fetch
+
+
 def build_install(root_dir: Path, files: dict[int, bytes], *,
                   product: str = "wow", version: str = "11.0.5.57212",
                   mfst: bool = True, locale_flags: int = 0xFFFFFFFF,
                   chunk_size: int = 0,
                   not_downloaded: dict[int, bytes] | None = None,
-                  no_encoding: dict[int, bytes] | None = None) -> Path:
+                  no_encoding: dict[int, bytes] | None = None,
+                  cdn: dict[int, bytes] | None = None,
+                  cdn_loose: set[int] = frozenset()) -> Path:
     """Write a CASC install under ``root_dir``.
 
     ``files`` are stored locally and readable.  ``not_downloaded`` are listed
     by the build and keyed by the encoding table, but no local archive holds
     them -- the install would stream them from the CDN.  ``no_encoding`` are
     named by root alone, which is the other way a listed file can be absent.
+    ``cdn`` files are not stored locally either, but a CDN under
+    ``root_dir/cdn`` holds them -- in an archive, or loose for the ids in
+    ``cdn_loose`` -- with the indices and config a real install keeps locally.
     """
     data_dir = root_dir / "Data" / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -205,6 +292,24 @@ def build_install(root_dir: Path, files: dict[int, bytes], *,
     for file_id, payload in sorted((no_encoding or {}).items()):
         root_entries[file_id] = md5(payload)
 
+    cdn_archive = bytearray(b"ARCHIVE-PREFIX--")     # offsets are not zero
+    archived: list[tuple[bytes, int, int, int]] = []
+    loose: list[tuple[bytes, int, int, int]] = []
+    for file_id, payload in sorted((cdn or {}).items()):
+        stream = make_blte(payload, chunk_size=chunk_size)
+        ekey = blte_ekey(stream)
+        ckey = md5(payload)
+        encoding_map[ckey] = (ekey, len(payload))
+        root_entries[file_id] = ckey
+        if file_id in cdn_loose:
+            path = root_dir / "cdn" / CDN_PATH / "data" / ekey.hex()[:2] / ekey.hex()[2:4]
+            path.mkdir(parents=True, exist_ok=True)
+            (path / ekey.hex()).write_bytes(stream)
+            loose.append((ekey, len(stream), -1, 0))
+        else:
+            archived.append((ekey, len(stream), 0, len(cdn_archive)))
+            cdn_archive += stream
+
     root_raw = make_root(root_entries, mfst=mfst, locale_flags=locale_flags)
     root_ckey = md5(root_raw)
     encoding_map[root_ckey] = (store(root_raw), len(root_raw))
@@ -224,6 +329,24 @@ def build_install(root_dir: Path, files: dict[int, bytes], *,
 
     build_key = md5(b"build" + version.encode()).hex()
     cdn_key = md5(b"cdn" + version.encode()).hex()
+
+    if cdn:
+        archive_name = md5(bytes(cdn_archive)).hex()
+        group_name = md5(b"group" + bytes(cdn_archive)).hex()
+        loose_name = md5(b"loose" + bytes(cdn_archive)).hex()
+        data = root_dir / "cdn" / CDN_PATH / "data" / archive_name[:2] / archive_name[2:4]
+        data.mkdir(parents=True, exist_ok=True)
+        (data / archive_name).write_bytes(bytes(cdn_archive))
+        indices = root_dir / "Data" / "indices"
+        indices.mkdir(parents=True, exist_ok=True)
+        (indices / f"{archive_name}.index").write_bytes(make_cdn_index(archived, 4))
+        (indices / f"{group_name}.index").write_bytes(make_cdn_index(archived, 6))
+        (indices / f"{loose_name}.index").write_bytes(make_cdn_index(loose, 0))
+        cdn_dir = root_dir / "Data" / "config" / cdn_key[0:2] / cdn_key[2:4]
+        cdn_dir.mkdir(parents=True, exist_ok=True)
+        (cdn_dir / cdn_key).write_text(
+            f"archives = {archive_name}\narchive-group = {group_name}\n"
+            f"file-index = {loose_name}\n", encoding="utf-8")
     config_dir = root_dir / "Data" / "config" / build_key[0:2] / build_key[2:4]
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / build_key).write_text(
@@ -235,7 +358,8 @@ def build_install(root_dir: Path, files: dict[int, bytes], *,
 
     (root_dir / ".build.info").write_text(
         "Branch!STRING:0|Active!DEC:1|Build Key!HEX:16|CDN Key!HEX:16|"
-        "Version!STRING:0|Product!STRING:0\n"
-        f"us|1|{build_key}|{cdn_key}|{version}|{product}\n",
+        "CDN Path!STRING:0|CDN Hosts!STRING:0|Version!STRING:0|Product!STRING:0\n"
+        f"us|1|{build_key}|{cdn_key}|{CDN_PATH}|{' '.join(CDN_HOSTS)}|"
+        f"{version}|{product}\n",
         encoding="utf-8")
     return root_dir

@@ -27,8 +27,9 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from ..errors import ConversionError
 from ..listfile import Listfile, normalise
@@ -61,6 +62,11 @@ class ColumnMap:
     #: Add the run's id offset, for the id column and references to it.
     id_offset: bool = False
     note: str = ""
+    #: A row-level resolver (see :data:`RESOLVERS`) for a value that has to be
+    #: joined from other tables rather than read out of one column, and its
+    #: keyword arguments.
+    resolve: str = ""
+    args: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
     def label(self) -> str:
@@ -74,6 +80,8 @@ class ColumnMap:
     def describe(self) -> str:
         if self.const is not None:
             return f"{self.label} = {self.const!r}"
+        if self.resolve:
+            return f"{self.label} <- {self.resolve}({self.args or ''})"
         return f"{self.label} <- {'|'.join(self.source) or '?'}"
 
 
@@ -90,9 +98,11 @@ class TableMapping:
     #: whether they were mapped explicitly or matched by name.
     id_offset_columns: tuple[str, ...] = ()
     source: str = "<builtin>"
+    #: Other tables the mapping's resolvers join against.
+    requires_tables: tuple[str, ...] = ()
 
     @classmethod
-    def from_dict(cls, payload: dict, source: str = "<memory>") -> "TableMapping":
+    def from_dict(cls, payload: dict, source: str = "<memory>") -> TableMapping:
         mapping = cls(
             table=payload["table"],
             target_field_count=int(payload.get("target_field_count", 0)),
@@ -100,6 +110,7 @@ class TableMapping:
             description=payload.get("description", ""),
             id_offset_columns=tuple(payload.get("id_offset_columns", [])),
             source=source,
+            requires_tables=tuple(payload.get("requires_tables", [])),
         )
         seen: set[tuple] = set()
         for spec in payload.get("columns", []):
@@ -134,9 +145,15 @@ class TableMapping:
                 sources = tuple(raw_from)
             else:
                 sources = ()
-            if not sources and "const" not in spec:
+            resolve = spec.get("resolve", "")
+            if resolve and resolve not in RESOLVERS:
                 raise ConversionError(
-                    f"{source}: field {index} has neither 'from' nor 'const'")
+                    f"{source}: unknown resolver {resolve!r}; known resolvers "
+                    f"are {', '.join(sorted(RESOLVERS))}")
+            if not sources and "const" not in spec and not resolve:
+                raise ConversionError(
+                    f"{source}: field {index} has neither 'from', 'const' nor "
+                    f"'resolve'")
             mapping.columns.append(ColumnMap(
                 index=index, target=target, target_array_index=array_index,
                 type=kind, source=sources,
@@ -147,6 +164,8 @@ class TableMapping:
                 scale=spec.get("scale"),
                 id_offset=bool(spec.get("id_offset", False)),
                 note=spec.get("note", ""),
+                resolve=resolve,
+                args=dict(spec.get("args", {})),
             ))
         if mapping.target_field_count:
             widest = max((c.index for c in mapping.columns
@@ -158,7 +177,7 @@ class TableMapping:
         return mapping
 
     @classmethod
-    def load(cls, path: str | os.PathLike[str]) -> "TableMapping":
+    def load(cls, path: str | os.PathLike[str]) -> TableMapping:
         p = Path(path)
         return cls.from_dict(json.loads(p.read_text(encoding="utf-8")), str(p))
 
@@ -203,12 +222,17 @@ class MappingLibrary:
 class TransformContext:
     """What a transform needs beyond the value itself."""
 
-    __slots__ = ("listfile", "path_prefix", "missing")
+    __slots__ = ("cache", "listfile", "missing", "path_prefix", "tables")
 
-    def __init__(self, listfile: Listfile | None = None, path_prefix: str = ""):
+    def __init__(self, listfile: Listfile | None = None, path_prefix: str = "",
+                 tables=None):
         self.listfile = listfile or Listfile()
         self.path_prefix = path_prefix
         self.missing: set[int] = set()
+        #: Other tables, for resolvers that join; see :mod:`.tables`.
+        self.tables = tables
+        #: Per-conversion state a resolver builds once.
+        self.cache: dict[str, Any] = {}
 
     def path_for(self, file_id: int) -> str:
         path = self.listfile.path_for(int(file_id))
@@ -249,6 +273,30 @@ def _t_identity(value: Any, _ctx: TransformContext) -> Any:
     return value
 
 
+def _t_clamp_zero(value: Any, _ctx: TransformContext) -> Any:
+    """Wrath has no -1 "unset" in columns modern builds give one."""
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _t_wrath_item_flags(value: Any, _ctx: TransformContext) -> int:
+    """Only ItemDisplayInfo flag bits 1, 2 and 4 existed in Wrath."""
+    try:
+        return int(value) & 0x7
+    except (TypeError, ValueError):
+        return 0
+
+
+def _t_wrath_liquid_vertex_format(value: Any, _ctx: TransformContext) -> int:
+    """3.3.5a has no vertex format 3 (height, UV and depth); keep the UVs."""
+    try:
+        return 1 if int(value) == 3 else int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 TRANSFORMS = {
     "": _t_identity,
     "identity": _t_identity,
@@ -258,7 +306,76 @@ TRANSFORMS = {
     "lower": lambda v, _c: str(v).lower(),
     "upper": lambda v, _c: str(v).upper(),
     "strip_extension": lambda v, _c: _strip_extension(str(v)),
+    "clamp_zero": _t_clamp_zero,
+    "wrath_item_flags": _t_wrath_item_flags,
+    "wrath_liquid_vertex_format": _t_wrath_liquid_vertex_format,
 }
+
+# Row-level resolvers, by name: ``fn(row, ctx, **args) -> value``.  These sit
+# here rather than at the top of the file because each of them imports the
+# transform table defined above; importing them any earlier is a cycle.  None
+# imports anything from this module, so the dependency only runs one way.
+from .grounddoodad import RESOLVERS as _GROUND_RESOLVERS  # noqa: E402
+from .itemdisplay import RESOLVERS as _ITEM_RESOLVERS  # noqa: E402
+from .liquidtypes import RESOLVERS as _LIQUID_RESOLVERS  # noqa: E402
+
+
+def _r_skybox_model(row: dict[str, Any], ctx: TransformContext) -> str:
+    """The skybox model, where 3.3.5a's LightSkybox.Name holds it.
+
+    Legion moved the model to SkyboxFileDataID and newer rows use Name for a
+    description ("12ZAM Sky 01"), which 3.3.5a and Noggit would try to load
+    as a file.
+    """
+    path = _t_model_path(row.get("SkyboxFileDataID") or 0, ctx)
+    if path:
+        return path
+    name = str(row.get("Name") or "")
+    return name if name.lower().endswith((".mdx", ".mdl", ".m2")) else ""
+
+
+#: LoadingScreens columns holding the image, most 3.3.5a-like first.
+LOADING_SCREEN_IMAGES = ("NarrowScreenFileDataID", "WideScreen169FileDataID",
+                         "WideScreenFileDataID", "MainImageFileDataID")
+
+
+def _r_loading_screen_file(row: dict[str, Any], ctx: TransformContext) -> str:
+    """The loading screen image, which Legion moved to FileDataID columns.
+
+    3.3.5a loads ``FileName`` (and, where ``HasWideScreen`` is set, the same
+    name with ``Wide`` before the extension); with it empty, entering the map
+    loads a file called "".
+    """
+    for column in LOADING_SCREEN_IMAGES:
+        path = _t_path(row.get(column) or 0, ctx)
+        if path:
+            return path
+    return str(row.get("FileName") or "")
+
+
+def _r_loading_screen_wide(row: dict[str, Any], ctx: TransformContext) -> int:
+    """1 when the wide image is the narrow one's name plus ``wide``, which is
+    the only name 3.3.5a derives."""
+    narrow = _t_path(row.get("NarrowScreenFileDataID") or 0, ctx)
+    wide = _t_path(row.get("WideScreenFileDataID") or 0, ctx)
+    if narrow and wide:
+        return int(wide.lower() == _strip_extension(narrow).lower() + "wide.blp")
+    return int(row.get("HasWideScreen") or 0)
+
+
+def _r_loading_screen_name(row: dict[str, Any], ctx: TransformContext) -> str:
+    name = str(row.get("Name") or "")
+    if name:
+        return name
+    path = _r_loading_screen_file(row, ctx)
+    return _strip_extension(os.path.basename(path.replace("\\", "/"))) if path else ""
+
+
+RESOLVERS = {**_ITEM_RESOLVERS, **_GROUND_RESOLVERS, **_LIQUID_RESOLVERS,
+             "lightskybox.model": _r_skybox_model,
+             "loadingscreens.file": _r_loading_screen_file,
+             "loadingscreens.wide": _r_loading_screen_wide,
+             "loadingscreens.name": _r_loading_screen_name}
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +409,11 @@ def apply_row(columns: Sequence[ColumnMap], row: dict[str, Any],
             continue
         if column.const is not None:
             value: Any = column.const
+        elif column.resolve:
+            try:
+                value = RESOLVERS[column.resolve](row, ctx, **column.args)
+            except LookupError as exc:
+                raise ConversionError(f"{source_name}: {column.label}: {exc}") from exc
         else:
             value = None
             for name in column.source:

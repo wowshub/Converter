@@ -1,10 +1,78 @@
 {
   "table": "CreatureModelData",
   "description": "The model file itself, plus its collision box and scale. Only the model path needs describing: every other column kept its name between the two builds and maps itself.",
-  "id_offset_columns": ["ID"],
+  "id_offset_columns": [
+    "ID"
+  ],
   "columns": [
-    {"target": ["ModelName", "ModelPath", "FileName"], "type": "string",
-     "from": ["FileDataID", "ModelName"], "transform": "model_path",
-     "note": "3.3.5a wants the .mdx spelling here; the client swaps it for .m2"}
+    {
+      "target": [
+        "ModelName",
+        "ModelPath",
+        "FileName"
+      ],
+      "type": "string",
+      "from": [
+        "FileDataID",
+        "ModelName"
+      ],
+      "transform": "model_path",
+      "note": "3.3.5a wants the .mdx spelling here; the client swaps it for .m2"
+    },
+    {
+      "target": [
+        "GeoBoxMinX"
+      ],
+      "type": "float",
+      "from": "GeoBox",
+      "array_index": 0,
+      "note": "GeoBox[6] is min xyz then max xyz",
+      "target_array_index": 0
+    },
+    {
+      "target": [
+        "GeoBoxMinY"
+      ],
+      "type": "float",
+      "from": "GeoBox",
+      "array_index": 1,
+      "target_array_index": 0
+    },
+    {
+      "target": [
+        "GeoBoxMinZ"
+      ],
+      "type": "float",
+      "from": "GeoBox",
+      "array_index": 2,
+      "target_array_index": 0
+    },
+    {
+      "target": [
+        "GeoBoxMaxX"
+      ],
+      "type": "float",
+      "from": "GeoBox",
+      "array_index": 3,
+      "target_array_index": 0
+    },
+    {
+      "target": [
+        "GeoBoxMaxY"
+      ],
+      "type": "float",
+      "from": "GeoBox",
+      "array_index": 4,
+      "target_array_index": 0
+    },
+    {
+      "target": [
+        "GeoBoxMaxZ"
+      ],
+      "type": "float",
+      "from": "GeoBox",
+      "array_index": 5,
+      "target_array_index": 0
+    }
   ]
 }

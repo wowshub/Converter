@@ -40,3 +40,45 @@ pythonpath = ["src", "tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+# Pinned on purpose. Ruff's default rule set grows between releases, so a
+# project that selects nothing lints differently for every contributor and
+# starts failing its own instructions after an unrelated upgrade. These are the
+# families this codebase is actually held to; add one deliberately rather than
+# inheriting it.
+[tool.ruff.lint]
+select = [
+    "E4", "E7", "E9",  # pycodestyle: the errors, not the whitespace opinions
+    "F",               # pyflakes
+    "I",               # import order
+    "UP",              # pyupgrade, bounded by target-version
+    "B",               # bugbear
+    "C4",              # comprehensions
+    "SIM",             # simplifications
+    "PIE",
+    "PYI",
+    "FURB",
+    "RUF",
+]
+ignore = [
+    # zip(a, b, strict=?) is a decision per call site about whether unequal
+    # lengths are a bug, and for a format converter they are often legitimate
+    # (a truncated chunk, an optional trailing array). Turning this on means
+    # answering that question 16 times, not adding a keyword.
+    "B905",
+    # Curly apostrophes in test prose are intentional.
+    "RUF001",
+    # Wants typing.Self, which is 3.11; this package supports 3.10.
+    "PYI034",
+]
+# Ruff's default dummy pattern rejects a trailing underscore, but `_rank_` is
+# how this codebase marks an unused binding whose obvious name would shadow a
+# module-level function (`_rank` in casc/root.py). Renaming it to `_rank` makes
+# that function a local and breaks the call above it, which is exactly what
+# F823 and 53 tests said when it was tried.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?)_?)$"
+
+[tool.ruff.lint.per-file-ignores]
+# The fixtures build deliberately malformed files, so unused bindings and
+# broad excepts are the point rather than an oversight.
+"tests/*" = ["B017", "RUF059"]

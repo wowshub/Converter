@@ -17,20 +17,35 @@ from __future__ import annotations
 import dataclasses
 import os
 import time
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
+from ..errors import ConversionError
 from ..listfile import Listfile
 from ..options import Options
 from ..report import FileResult, Status
 from . import dbd
 from .db2 import Db2Table, parse_db2
 from .dbc import DbcBuilder, DbcTable
-from ..errors import ConversionError
-from .mapping import (ColumnMap, MappingLibrary, TableMapping,
-                      TransformContext, apply_row, missing_sources,
-                      resolve_columns)
-from .target import (WOTLK_BUILD, auto_map, cross_check, describe as
-                     describe_layout, layout_from_dbd, layout_from_field_count)
+from .mapping import (
+    ColumnMap,
+    MappingLibrary,
+    TableMapping,
+    TransformContext,
+    apply_row,
+    missing_sources,
+    resolve_columns,
+)
+from .target import (
+    LOCSTRING_FLAGS,
+    WOTLK_BUILD,
+    auto_map,
+    cross_check,
+    layout_from_dbd,
+    layout_from_field_count,
+)
+from .target import describe as describe_layout
+
 
 def table_name_for(path: str) -> str:
     """``dbfilesclient/creaturedisplayinfo.db2`` -> ``creaturedisplayinfo``."""
@@ -72,8 +87,13 @@ def convert_db2(data: bytes, source_name: str, opts: Options,
                 library: MappingLibrary | None = None,
                 template_data: bytes | None = None,
                 table: str | None = None,
-                result: FileResult | None = None) -> tuple[bytes, FileResult]:
-    """Convert one client database. Returns (DBC bytes, result)."""
+                result: FileResult | None = None,
+                tables=None) -> tuple[bytes, FileResult]:
+    """Convert one client database. Returns (DBC bytes, result).
+
+    ``tables`` (a :class:`~.tables.TableProvider`) gives resolvers the other
+    tables a mapping joins against, such as ItemDisplayInfo's.
+    """
     started = time.time()
     res = result or FileResult(source=source_name, kind="db2")
     res.kind = "db2"
@@ -120,6 +140,20 @@ def convert_db2(data: bytes, source_name: str, opts: Options,
                  f"({mapping.target_field_count}) is being used unchecked. "
                  f"Pass --template with your client's {table_name}.dbc, or "
                  f"update your DBDefs checkout")
+    elif definition is not None and not template_data:
+        # The definition knows the table and its Wrath history, and has no
+        # layout for Wrath: the table did not exist then (none of the 951 such
+        # tables in 12.1 is among a clean 3.3.5a client's 246).  The client
+        # never reads it, so there is nothing to write -- that is a skip, not
+        # a failure.  A template .dbc for it would contradict that, and is
+        # still handled as an error below.
+        res.status = Status.SKIPPED
+        res.info("db2.not_in_wrath",
+                 f"{table_name} did not exist in 3.3.5a: its definition has no "
+                 f"layout for build {WOTLK_BUILD}, so the client has no such "
+                 f"table and nothing is written")
+        res.elapsed = time.time() - started
+        return b"", res
     else:
         extra = ""
         if template_data:
@@ -139,15 +173,24 @@ def convert_db2(data: bytes, source_name: str, opts: Options,
         res.elapsed = time.time() - started
         return b"", res
 
+    field_sizes = [f.size for f in target.fields]
+    if target.narrow_fields:
+        res.info("db2.field_widths",
+                 f"{len(target.narrow_fields)} 3.3.5a column(s) are narrower "
+                 f"than four bytes; records are {sum(field_sizes)} bytes",
+                 record_size=sum(field_sizes))
+
     if mapping is None:
         # Nothing table-specific to say: both sides are named, so the columns
         # that kept their names map themselves.
-        mapping = TableMapping(table=table_name, source="<auto>", id_index=0)
+        mapping = TableMapping(table=table_name, source="<auto>",
+                               id_index=target.id_index)
 
     # -- template cross-check ---------------------------------------------
     template: DbcTable | None = None
     if template_data:
-        template = DbcTable.parse(template_data, f"{table_name}.dbc")
+        template = DbcTable.parse(template_data, f"{table_name}.dbc",
+                                  field_sizes=field_sizes)
         problem = cross_check(target, template.field_count, table_name)
         if problem:
             res.fail("db2.layout_mismatch", problem,
@@ -193,8 +236,17 @@ def convert_db2(data: bytes, source_name: str, opts: Options,
                  f"builds; {len(claimed)} came from the mapping",
                  auto=len(auto), explicit=len(claimed))
 
+    # A locstring's other locales stay empty and its mask is the one every
+    # enUS table carries; neither is a column anyone could map.
+    mapped = {c.index for c in columns}
+    for field in target.fields:
+        if field.role == "locale_flags" and field.index not in mapped:
+            columns.append(ColumnMap(index=field.index, target=(field.name,),
+                                     target_array_index=field.array_index,
+                                     type="uint", const=LOCSTRING_FLAGS))
     unmapped = [f.label for f in target.fields
-                if f.index not in {c.index for c in columns}]
+                if f.index not in {c.index for c in columns}
+                and not f.conventional]
     if unmapped:
         res.lossy("db2.columns_unmapped",
                   f"{len(unmapped)} 3.3.5a column(s) have no source and were "
@@ -209,13 +261,33 @@ def convert_db2(data: bytes, source_name: str, opts: Options,
                   + ", ".join(c.describe() for c in absent[:8]),
                   columns=[c.describe() for c in absent])
 
+    # A few Wrath tables have no id column at all (CharBaseInfo is RaceID and
+    # ClassID; PaperDollItemFrame is a name and a slot).  Keying their rows by
+    # the first field collapsed every race to one row, so such a table is
+    # keyed by the modern row id, and merging appends rather than matching.
+    keyed = any(f.is_id for f in target.fields) or not target.named
     merge = bool(template) and opts.db_merge
-    builder = DbcBuilder(field_count, template if merge else None)
-    if merge:
+    builder = DbcBuilder(field_count, template if merge else None,
+                         field_sizes=field_sizes)
+    if merge and keyed:
         builder.index_existing(mapping.id_index)
     existing_before = len(builder.records)
 
-    ctx = TransformContext(listfile, opts.path_prefix)
+    if any(c.resolve for c in columns):
+        if tables is None:
+            res.fail("db2.tables_unavailable",
+                     f"{table_name}'s columns are joined from other tables "
+                     f"({', '.join(mapping.requires_tables) or 'see its mapping'}), "
+                     f"and this conversion has no way to read them")
+            res.elapsed = time.time() - started
+            return b"", res
+        absent_tables = tables.missing(list(mapping.requires_tables))
+        if absent_tables:
+            res.lossy("db2.tables_missing",
+                      f"{len(absent_tables)} table(s) the joins need could not "
+                      f"be read, so the columns built from them are empty: "
+                      + ", ".join(absent_tables), tables=absent_tables)
+    ctx = TransformContext(listfile, opts.path_prefix, tables)
 
     # -- rows -------------------------------------------------------------
     wanted_ids = set(opts.db_row_ids) if opts.db_row_ids else None
@@ -228,7 +300,8 @@ def convert_db2(data: bytes, source_name: str, opts: Options,
             continue
         values = apply_row(columns, row, ctx, opts.db_id_offset,
                            mapping.source)
-        target_id = values.get(mapping.id_index, ("uint", row_id))[1]
+        target_id = (values.get(mapping.id_index, ("uint", row_id))[1]
+                     if keyed else row_id)
         if builder.add(values, int(target_id), mapping.id_index):
             added += 1
         else:

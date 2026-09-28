@@ -7,9 +7,12 @@ import os
 import struct
 import time
 
+from ..chunks import ChunkWriter, report_unknown
 from ..limits import (
     MODD_SIZE,
+    MOGI_SIZE,
     MOHD_SIZE,
+    MOLT_SIZE,
     MOMT_SIZE,
     WMO_HEADER_FLAG_MASK,
     WMO_MATERIAL_FLAG_MASK,
@@ -19,15 +22,17 @@ from ..limits import (
     WMO_VERSION,
     WMO_VERSION_OLDEST_READABLE,
 )
-from ..listfile import Listfile, normalise
+from ..listfile import Listfile, normalise, placeholder_path
 from ..options import Options, UnresolvedPolicy
 from ..report import FileResult, Status
 from ..resolve import AssetSource
-from ..limits import MOGI_SIZE
 from .group import convert_group_parts
-from ..chunks import ChunkWriter, report_unknown
-from .root import (ALL_KNOWN as ALL_KNOWN_ROOT, MODERN_ROOT_CHUNKS,
-                   StringTable, WmoRoot, parse_root, split_string_table)
+from .root import ALL_KNOWN as ALL_KNOWN_ROOT
+from .root import MODERN_ROOT_CHUNKS, StringTable, WmoRoot, parse_root, split_string_table
+
+#: MAVG and MAVD entries: position, start and end radius, three colours,
+#: flags, doodad set and padding.
+AMBIENT_VOLUME_SIZE = 48
 
 
 @dataclasses.dataclass(slots=True)
@@ -62,7 +67,7 @@ def _resolve(file_id: int, kind: str, opts: Options, listfile: Listfile,
                          f"dropped unresolvable {kind} FileDataID {file_id}",
                          file_id=file_id, kind=kind)
             return ""
-        path = normalise(f"unresolved/{kind}/{file_id}.{kind}")
+        path = placeholder_path(file_id, kind)
         result.lossy("wmo.reference.placeholder",
                      f"{kind} FileDataID {file_id} is not in the listfile; "
                      f"pointed it at {path}", file_id=file_id, path=path)
@@ -90,9 +95,16 @@ def _rebuild_materials(root: WmoRoot, opts: Options, listfile: Listfile,
     clamped_blend = 0
     clamped_flags = 0
     resolved_ids = 0
+    promoted = 0
 
-    # texture_1, texture_2, texture_3 live at these offsets in SMOMaterial.
-    texture_fields = (12, 24, 32)
+    # texture_1, texture_2, texture_3 live at these offsets in SMOMaterial;
+    # 32, between the last two, is the ground type (footstep sounds and
+    # effects), which is not a texture at all.
+    texture_fields = (12, 24, 36)
+    # A modern material says "no texture" with FileDataID 0, but in a string
+    # table 0 is the first name.  3.3.5a's own files point an absent texture
+    # at an empty entry instead.
+    empty = None
 
     for i in range(count):
         base = i * MOMT_SIZE
@@ -101,7 +113,8 @@ def _rebuild_materials(root: WmoRoot, opts: Options, listfile: Listfile,
         masked = flags & WMO_MATERIAL_FLAG_MASK
         if masked != flags:
             clamped_flags += 1
-        if shader > WMO_MAX_SHADER:
+        shader_clamped = shader > WMO_MAX_SHADER
+        if shader_clamped:
             clamped_shader += 1
             shader = 0  # plain diffuse always renders
         if blend > WMO_MAX_BLEND_MODE:
@@ -112,6 +125,10 @@ def _rebuild_materials(root: WmoRoot, opts: Options, listfile: Listfile,
         for field in texture_fields:
             value = struct.unpack_from("<I", out, base + field)[0]
             if value == 0:
+                if uses_file_ids:
+                    if empty is None:
+                        empty = table.add("")
+                    struct.pack_into("<I", out, base + field, empty)
                 continue
             if uses_file_ids:
                 path = _resolve(value, "blp", opts, listfile, result)
@@ -129,6 +146,24 @@ def _rebuild_materials(root: WmoRoot, opts: Options, listfile: Listfile,
             struct.pack_into("<I", out, base + field,
                              table.add(path) if path else 0)
 
+        if uses_file_ids and shader_clamped:
+            # Legion's shader 23 leaves texture_1 empty and keeps its diffuse
+            # in texture_2, with further textures in color_3, flags_3 and the
+            # runtime words.  Diffuse reads texture_1 only, and 3.3.5a takes
+            # those words for a colour and flags.
+            first, second = struct.unpack_from("<I", out, base + 12)[0], \
+                struct.unpack_from("<I", out, base + 24)[0]
+            if first == empty and second != empty:
+                struct.pack_into("<I", out, base + 12, second)
+                promoted += 1
+            out[base + 40:base + MOMT_SIZE] = bytes(MOMT_SIZE - 40)
+
+    if promoted:
+        result.lossy("wmo.material.texture_promoted",
+                     f"{promoted} material(s) kept their diffuse texture in the "
+                     f"second slot for a newer shader; moved it to the first, "
+                     f"which the diffuse shader 3.3.5a falls back to reads",
+                     materials=promoted)
     if clamped_shader:
         result.lossy("wmo.material.shader",
                      f"{clamped_shader} material(s) used a shader newer than "
@@ -215,6 +250,43 @@ def _skybox(root: WmoRoot, opts: Options, listfile: Listfile,
     return b"\0" * 4
 
 
+def _ambient_colour(root: WmoRoot, mohd: bytearray, result: FileResult) -> None:
+    """Give MOHD the ambient colour retail keeps in its ambient volumes.
+
+    Legion moved a world object's ambient light into ``MAVG`` (global, per
+    doodad set) and ``MAVD`` (local volumes), which the client prefers over
+    ``MOHD``'s colour; 4,366 retail roots leave that colour black.  3.3.5a
+    only reads ``MOHD``, so it gets the default set's global colour, or when
+    ``MOHD`` is black and there is no global one, the first volume's.
+    """
+    def lit(blob: bytes) -> list[bytes]:
+        """Entries whose colour is not black: a black one sets nothing."""
+        return [e for e in (blob[i:i + AMBIENT_VOLUME_SIZE] for i in
+                            range(0, len(blob) - AMBIENT_VOLUME_SIZE + 1,
+                                  AMBIENT_VOLUME_SIZE))
+                if struct.unpack_from("<I", e, 0x14)[0] & 0xFFFFFF]
+
+    current = struct.unpack_from("<I", mohd, 0x1C)[0]
+    entries = lit(root.payload("MAVG"))
+    chosen = next((e for e in entries if struct.unpack_from("<H", e, 0x24)[0] == 0),
+                  entries[0] if entries else None)
+    where = "the global ambient volume"
+    if chosen is None and not current & 0xFFFFFF:
+        volumes = lit(root.payload("MAVD"))
+        if volumes:
+            chosen, where = volumes[0], "its first ambient volume"
+    if chosen is None:
+        return
+    colour = struct.unpack_from("<I", chosen, 0x14)[0]
+    if colour == current:
+        return
+    struct.pack_into("<I", mohd, 0x1C, colour)
+    if not current & 0xFFFFFF:
+        result.info("wmo.ambient",
+                    f"took the ambient colour 0x{colour:08X} from {where}; the "
+                    f"header's was black, and 3.3.5a reads only the header")
+
+
 def convert_wmo_root(data: bytes, source_name: str, opts: Options,
                      listfile: Listfile | None = None,
                      source: AssetSource | None = None,
@@ -298,9 +370,17 @@ def convert_wmo_root(data: bytes, source_name: str, opts: Options,
     total_groups = root.n_groups + len(additions)
 
     mohd = bytearray(root.payload("MOHD")[:MOHD_SIZE])
-    struct.pack_into("<I", mohd, 0, len(split_string_table(motx)) if motx else 0)
+    # nMaterials: the MOMT entry count, which 3.3.5a and Noggit size the
+    # material array from (their own WMOs always agree), not the MOTX names.
+    struct.pack_into("<I", mohd, 0, len(momt) // MOMT_SIZE)
     struct.pack_into("<I", mohd, 4, total_groups)
+    # A few retail roots declare more lights than MOLT holds; a reader that
+    # trusts the header reads the next chunk as lights.
+    struct.pack_into("<I", mohd, 12, len(root.payload("MOLT")) // MOLT_SIZE)
     struct.pack_into("<I", mohd, 16, len(split_string_table(modn)) if modn else 0)
+    # 1,488 retail roots declare more doodads than MODD holds.
+    struct.pack_into("<I", mohd, 20, len(modd) // MODD_SIZE)
+    _ambient_colour(root, mohd, res)
     flags = root.header_flags & WMO_HEADER_FLAG_MASK
     struct.pack_into("<I", mohd, 60, flags)
     if root.num_lod:
@@ -375,17 +455,24 @@ def _convert_groups(root: WmoRoot, source_name: str, opts: Options,
     found = 0
     for index in range(root.n_groups):
         raw = None
-        if index < len(group_ids) and group_ids[index]:
-            raw = source.by_file_id(group_ids[index], ".wmo")
+        group_id = group_ids[index] if index < len(group_ids) else 0
+        if group_id:
+            raw = source.by_file_id(group_id, ".wmo")
         if raw is None:
             raw = source.by_path(f"{src_stem}_{index:03d}.wmo")
-        if raw is None:
-            continue
         name = f"{stem}_{index:03d}.wmo"
-        sub = FileResult(source=name, kind="wmo-group")
+        if raw is None:
+            if group_id and source.casc is not None and group_id in source.casc:
+                sub = FileResult(source=name, kind="wmo-group",
+                                 status=Status.SKIPPED, file_id=group_id)
+                sub.info("wmo.group.unavailable", "group file referenced by "
+                         "the root could not be read", file_id=group_id)
+                out.append(ConvertedAsset(name, b"", sub))
+            continue
+        sub = FileResult(source=name, kind="wmo-group", file_id=group_id or None)
         try:
             pieces, sub = convert_group_parts(raw, name, opts, sub)
-        except Exception as exc:  # noqa: BLE001 - reported per file
+        except Exception as exc:
             sub.fail("wmo.group.error", f"{type(exc).__name__}: {exc}")
             out.append(ConvertedAsset(name, b"", sub))
             continue
@@ -398,7 +485,7 @@ def _convert_groups(root: WmoRoot, source_name: str, opts: Options,
         for piece in pieces[1:]:
             extra_name = f"{stem}_{next_number:03d}.wmo"
             extra = FileResult(source=extra_name, kind="wmo-group",
-                               status=sub.status)
+                               status=sub.status, file_id=sub.file_id)
             extra.info("wmo.group.split_part",
                        f"part {piece.part} of {name}, created because that "
                        f"group had more vertices than 16-bit indices reach")

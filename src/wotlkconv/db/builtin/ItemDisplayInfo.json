@@ -1,17 +1,241 @@
 {
   "table": "ItemDisplayInfo",
-  "description": "Models, textures and icons for an equippable item. Modern builds moved the component textures into ItemDisplayInfoMaterialRes, so those columns have no source here and come out empty.",
-  "id_offset_columns": ["ID"],
+  "description": "Models, textures and icon for an equippable item. Modern builds keep none of these on the row, so every name is joined from ModelFileData, TextureFileData, ItemDisplayInfoMaterialRes and ItemAppearance (see wotlkconv/db/itemdisplay.py for the rules and their measured agreement with a clean 3.3.5a client). ItemVisual and ParticleColorID map themselves by name.",
+  "id_offset_columns": [
+    "ID"
+  ],
+  "requires_tables": [
+    "ModelFileData",
+    "ComponentModelFileData",
+    "TextureFileData",
+    "ComponentTextureFileData",
+    "ItemDisplayInfoMaterialRes",
+    "ItemAppearance",
+    "ItemModifiedAppearance",
+    "Item",
+    "ItemRangedDisplayInfo",
+    "ChrRaces"
+  ],
   "columns": [
-    {"target": ["LeftModel", "ModelName"], "target_array_index": 0,
-     "type": "string", "from": "ModelResourcesID", "array_index": 0,
-     "transform": "model_path"},
-    {"target": ["RightModel", "ModelName"], "target_array_index": 1,
-     "type": "string", "from": "ModelResourcesID", "array_index": 1,
-     "transform": "model_path"},
-    {"target": ["InventoryIcon"], "target_array_index": 0, "type": "string",
-     "from": "InventoryIcon", "array_index": 0, "transform": "basename"},
-    {"target": ["InventoryIcon"], "target_array_index": 1, "type": "string",
-     "from": "InventoryIcon", "array_index": 1, "transform": "basename"}
+    {
+      "target": [
+        "ModelName"
+      ],
+      "target_array_index": 0,
+      "type": "string",
+      "resolve": "itemdisplay.model",
+      "args": {
+        "index": 0
+      },
+      "note": "bare file name with .mdx; helmets without their race/gender suffix"
+    },
+    {
+      "target": [
+        "ModelName"
+      ],
+      "target_array_index": 1,
+      "type": "string",
+      "resolve": "itemdisplay.model",
+      "args": {
+        "index": 1
+      }
+    },
+    {
+      "target": [
+        "ModelTexture"
+      ],
+      "target_array_index": 0,
+      "type": "string",
+      "resolve": "itemdisplay.model_texture",
+      "args": {
+        "index": 0
+      }
+    },
+    {
+      "target": [
+        "ModelTexture"
+      ],
+      "target_array_index": 1,
+      "type": "string",
+      "resolve": "itemdisplay.model_texture",
+      "args": {
+        "index": 1
+      }
+    },
+    {
+      "target": [
+        "InventoryIcon"
+      ],
+      "target_array_index": 0,
+      "type": "string",
+      "resolve": "itemdisplay.icon"
+    },
+    {
+      "target": [
+        "InventoryIcon"
+      ],
+      "target_array_index": 1,
+      "type": "string",
+      "const": "",
+      "note": "used by 7 rows in Wrath; modern builds have no second icon"
+    },
+    {
+      "target": [
+        "GeosetGroup"
+      ],
+      "target_array_index": 0,
+      "type": "int",
+      "from": "GeosetGroup",
+      "array_index": 0,
+      "transform": "clamp_zero"
+    },
+    {
+      "target": [
+        "GeosetGroup"
+      ],
+      "target_array_index": 1,
+      "type": "int",
+      "from": "GeosetGroup",
+      "array_index": 1,
+      "transform": "clamp_zero"
+    },
+    {
+      "target": [
+        "GeosetGroup"
+      ],
+      "target_array_index": 2,
+      "type": "int",
+      "from": "GeosetGroup",
+      "array_index": 2,
+      "transform": "clamp_zero"
+    },
+    {
+      "target": [
+        "Flags"
+      ],
+      "type": "uint",
+      "from": "Flags",
+      "transform": "wrath_item_flags"
+    },
+    {
+      "target": [
+        "SpellVisualID"
+      ],
+      "type": "int",
+      "resolve": "itemdisplay.spell_visual"
+    },
+    {
+      "target": [
+        "GroupSoundIndex"
+      ],
+      "type": "int",
+      "resolve": "itemdisplay.group_sound"
+    },
+    {
+      "target": [
+        "HelmetGeosetVisID"
+      ],
+      "target_array_index": 0,
+      "type": "int",
+      "from": "HelmetGeosetVis",
+      "array_index": 0
+    },
+    {
+      "target": [
+        "HelmetGeosetVisID"
+      ],
+      "target_array_index": 1,
+      "type": "int",
+      "from": "HelmetGeosetVis",
+      "array_index": 1
+    },
+    {
+      "target": [
+        "Texture"
+      ],
+      "target_array_index": 0,
+      "type": "string",
+      "resolve": "itemdisplay.texture",
+      "args": {
+        "section": 0
+      }
+    },
+    {
+      "target": [
+        "Texture"
+      ],
+      "target_array_index": 1,
+      "type": "string",
+      "resolve": "itemdisplay.texture",
+      "args": {
+        "section": 1
+      }
+    },
+    {
+      "target": [
+        "Texture"
+      ],
+      "target_array_index": 2,
+      "type": "string",
+      "resolve": "itemdisplay.texture",
+      "args": {
+        "section": 2
+      }
+    },
+    {
+      "target": [
+        "Texture"
+      ],
+      "target_array_index": 3,
+      "type": "string",
+      "resolve": "itemdisplay.texture",
+      "args": {
+        "section": 3
+      }
+    },
+    {
+      "target": [
+        "Texture"
+      ],
+      "target_array_index": 4,
+      "type": "string",
+      "resolve": "itemdisplay.texture",
+      "args": {
+        "section": 4
+      }
+    },
+    {
+      "target": [
+        "Texture"
+      ],
+      "target_array_index": 5,
+      "type": "string",
+      "resolve": "itemdisplay.texture",
+      "args": {
+        "section": 5
+      }
+    },
+    {
+      "target": [
+        "Texture"
+      ],
+      "target_array_index": 6,
+      "type": "string",
+      "resolve": "itemdisplay.texture",
+      "args": {
+        "section": 6
+      }
+    },
+    {
+      "target": [
+        "Texture"
+      ],
+      "target_array_index": 7,
+      "type": "string",
+      "resolve": "itemdisplay.texture",
+      "args": {
+        "section": 7
+      }
+    }
   ]
 }

@@ -1,0 +1,14 @@
+{
+  "table": "AreaTable",
+  "description": "Areas. Modern builds dropped MinElevation; 3.3.5a's own table gives -500 to 2,298 of its 2,307 areas.",
+  "columns": [
+    {
+      "target": [
+        "MinElevation"
+      ],
+      "type": "float",
+      "const": -500.0,
+      "note": "3.3.5a's usual value; modern builds have no such column"
+    }
+  ]
+}

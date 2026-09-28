@@ -19,11 +19,19 @@ install.
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from . import log
 from .listfile import Listfile, to_posix
+
+#: Bytes of companion files remembered between lookups.  Skeletons and skins
+#: are shared by many models converted near each other, so a small window pays
+#: for itself; an unbounded one kept every companion of a whole build in each
+#: worker, growing ~30 MB a minute apiece on a retail install.
+CACHE_BYTES = 128 * 1024 * 1024
+CACHE_ENTRIES = 8192
 
 
 class AssetSource:
@@ -31,14 +39,39 @@ class AssetSource:
 
     def __init__(self, listfile: Listfile | None = None,
                  roots: Sequence[str | os.PathLike[str]] = (),
-                 extensions: Sequence[str] = (), casc=None):
+                 extensions: Sequence[str] = (), casc=None,
+                 cache_bytes: int = CACHE_BYTES,
+                 cache_entries: int = CACHE_ENTRIES):
         self.listfile = listfile or Listfile()
         self.roots: list[Path] = [Path(r) for r in roots]
         self.extensions = list(extensions) or [".m2", ".skel", ".skin", ".anim",
                                                ".blp", ".bone", ".wmo"]
         self.casc = casc
-        self._cache: dict[str, bytes | None] = {}
+        self.cache_bytes = cache_bytes
+        self.cache_entries = cache_entries
+        self._cache: OrderedDict[str, bytes | None] = OrderedDict()
+        self._cached_bytes = 0
         self._index: dict[str, Path] | None = None
+
+    # -- cache ----------------------------------------------------------
+    def _recall(self, key: str) -> tuple[bool, bytes | None]:
+        if key not in self._cache:
+            return False, None
+        self._cache.move_to_end(key)
+        return True, self._cache[key]
+
+    def _remember(self, key: str, result: bytes | None) -> None:
+        """Keep a lookup, least recently used first out once over budget."""
+        previous = self._cache.pop(key, None)
+        if previous:
+            self._cached_bytes -= len(previous)
+        self._cache[key] = result
+        self._cached_bytes += len(result) if result else 0
+        while self._cache and (self._cached_bytes > self.cache_bytes
+                               or len(self._cache) > self.cache_entries):
+            _old_key, old = self._cache.popitem(last=False)
+            if old:
+                self._cached_bytes -= len(old)
 
     # -- roots ----------------------------------------------------------
     def add_root(self, root: str | os.PathLike[str]) -> None:
@@ -77,8 +110,9 @@ class AssetSource:
     def by_path(self, game_path: str) -> bytes | None:
         """Find a file given its in-game path (``\\`` or ``/`` separated)."""
         key = f"p:{game_path.lower()}"
-        if key in self._cache:
-            return self._cache[key]
+        hit, cached = self._recall(key)
+        if hit:
+            return cached
         rel = to_posix(game_path)
         result: bytes | None = None
         for root in self.roots:
@@ -87,10 +121,10 @@ class AssetSource:
                 result = self._read(candidate)
                 break
         if result is None:
-            hit = self._basename_index().get(os.path.basename(rel).lower())
-            if hit is not None:
-                result = self._read(hit)
-        self._cache[key] = result
+            found = self._basename_index().get(os.path.basename(rel).lower())
+            if found is not None:
+                result = self._read(found)
+        self._remember(key, result)
         return result
 
     def by_file_id(self, file_id: int, extension: str = "") -> bytes | None:
@@ -98,8 +132,9 @@ class AssetSource:
         if not file_id:
             return None
         key = f"i:{file_id}:{extension}"
-        if key in self._cache:
-            return self._cache[key]
+        hit, cached = self._recall(key)
+        if hit:
+            return cached
 
         result: bytes | None = None
         exts = [extension] if extension else self.extensions
@@ -124,7 +159,7 @@ class AssetSource:
                 log.debug(f"CASC lookup for {file_id} failed: {why}")
             result = data
 
-        self._cache[key] = result
+        self._remember(key, result)
         return result
 
     def loader_for(self, extension: str):

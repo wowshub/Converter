@@ -27,7 +27,7 @@ from ..limits import (
 from ..options import Options, TextureFormat
 from ..report import FileResult, Status
 from . import bcn
-from .blp import FORMAT_NAMES, Blp, PreferredFormat
+from .blp import FORMAT_NAMES, Blp, EmptyTextureError, PreferredFormat
 from .image import Image, is_pot, nearest_pot
 from .quantize import PaletteMapper, build_palette
 
@@ -137,6 +137,30 @@ def _target_dimensions(width: int, height: int, opts: Options,
     return tw, th
 
 
+def _agree_alpha_depth(src: Blp, res: FileResult) -> None:
+    """Make a block texture's alpha depth say what its blocks are.
+
+    3.3.5a picks the block format from the alpha depth first -- 0 or 1 means
+    DXT1 -- and only then from the alpha type, so a DXT5 texture declaring
+    depth 0, or any texture declaring a depth like 72 (33 retail textures do),
+    is decoded as the wrong format.
+    """
+    if src.compression != BLP_COMPRESSION_DXT:
+        return
+    depth = src.alpha_size
+    if src.alpha_type == PreferredFormat.DXT1:
+        fixed = depth if depth in (0, 1) else 1
+    else:
+        fixed = depth if depth in (4, 8) else 8
+    if fixed != depth:
+        src.alpha_size = fixed
+        res.info("blp.alpha_depth",
+                 f"alpha depth {depth} does not match "
+                 f"{FORMAT_NAMES.get(src.alpha_type, src.alpha_type)} blocks, and "
+                 f"3.3.5a picks the block format from it; wrote {fixed}",
+                 source=depth, written=fixed)
+
+
 def convert_blp(data: bytes, source_name: str, opts: Options,
                 result: FileResult | None = None) -> tuple[bytes, FileResult]:
     """Convert one BLP payload. Returns (output bytes, result)."""
@@ -145,7 +169,14 @@ def convert_blp(data: bytes, source_name: str, opts: Options,
     res.kind = "blp"
     res.bytes_in = len(data)
 
-    src = Blp.parse(data, source_name)
+    try:
+        src = Blp.parse(data, source_name)
+    except EmptyTextureError as exc:
+        res.status = Status.SKIPPED
+        res.elapsed = time.time() - started
+        res.info("blp.empty", f"{exc}; a placeholder with nothing to convert, "
+                 "so no file is written")
+        return b"", res
     res.source_version = f"BLP2/{src.encoding_name} {src.width}x{src.height} " \
                          f"mips={src.mip_count}"
 
@@ -158,6 +189,7 @@ def convert_blp(data: bytes, source_name: str, opts: Options,
     if compatible and size_ok and keep_encoding and src.mip_count:
         # Nothing to do: re-emit the container verbatim so block data is bit
         # identical and no generation loss creeps in.
+        _agree_alpha_depth(src, res)
         out = src.serialize()
         res.status = Status.PASSTHROUGH
         res.target_version = res.source_version

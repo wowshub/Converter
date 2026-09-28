@@ -15,8 +15,8 @@ import struct
 from ..binio import Writer
 from ..errors import MalformedFileError, UnsupportedFormatError
 from ..limits import (
-    M2_MAX_BONES_PER_SUBMESH,
     M2_MAX_BONE_INFLUENCES,
+    M2_MAX_BONES_PER_SUBMESH,
     M2_MAX_TEXTURE_UNITS,
     M2_MAX_VERTICES,
     SKIN_HEADER_SIZE_LEGION,
@@ -33,6 +33,7 @@ SHADOW_BATCH_SIZE = 12
 #: Byte offsets inside M2Batch.
 BATCH_SHADER_ID = 0x02
 BATCH_TEXTURE_COUNT = 0x0E
+BATCH_TEXTURE_COORD_COMBO = 0x12
 
 #: M2Batch.shader_id bit meaning "index into the model's texture combiner combos".
 SHADER_COMBINER_FLAG = 0x8000
@@ -205,8 +206,8 @@ def _validate_submeshes(skin: Skin, opts: Options, result: FileResult) -> None:
     over_bones = 0
     over_influences = 0
     over_indices = 0
-    for i, raw in enumerate(skin.submeshes):
-        (_sid, level, vertex_start, vertex_count, _istart, index_count,
+    for _i, raw in enumerate(skin.submeshes):
+        (_sid, _level, vertex_start, vertex_count, _istart, _index_count,
          bone_count, _bone_combo, influences, _center) = struct.unpack_from(
             "<10H", raw, 0)
         if bone_count > M2_MAX_BONES_PER_SUBMESH:
@@ -235,6 +236,26 @@ def _validate_submeshes(skin: Skin, opts: Options, result: FileResult) -> None:
                      submeshes=over_influences)
 
 
+#: The bone palette sizes 3.3.5a's skins declare.  Every one of its 23,941
+#: skins names the smallest of these that holds its largest submesh's bones
+#: (41 name a larger one); retail writes 0 in all of them.
+BONE_PALETTE_SIZES = (21, 53, 64, 256)
+
+
+def _settle_bone_count_max(skin: Skin, res: FileResult) -> None:
+    """Declare a bone palette that holds every submesh's bones."""
+    needed = max((struct.unpack_from("<H", raw, 12)[0] for raw in skin.submeshes),
+                 default=0)
+    if skin.bone_count_max >= needed and skin.bone_count_max:
+        return
+    size = next((s for s in BONE_PALETTE_SIZES if s >= needed), BONE_PALETTE_SIZES[-1])
+    res.info("skin.bone_count_max",
+             f"declared a bone palette of {size} (the source said "
+             f"{skin.bone_count_max}; its largest submesh uses {needed} bones)",
+             source=skin.bone_count_max, written=size)
+    skin.bone_count_max = size
+
+
 def downgrade_skin(skin: Skin, opts: Options, uses_combiner_combos: bool,
                    res: FileResult) -> bool:
     """Apply the 3.3.5a clamps to an already-parsed skin. False if unusable."""
@@ -253,6 +274,7 @@ def downgrade_skin(skin: Skin, opts: Options, uses_combiner_combos: bool,
 
     _clamp_batches(skin, uses_combiner_combos, res)
     _validate_submeshes(skin, opts, res)
+    _settle_bone_count_max(skin, res)
     return res.ok
 
 

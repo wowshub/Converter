@@ -31,6 +31,11 @@ WOTLK_BUILD = "3.3.5.12340"
 WOTLK_BUILD_ALIASES = ("3.3.5.12340", "3.3.5a.12340", "3.3.5.12213",
                        "3.3.3.11723", "3.3.0.10772")
 
+#: A Wrath ``locstring`` is a string offset per locale -- enUS first -- then a
+#: mask.  Every row of an enUS 3.3.5a client's tables carries this mask.
+LOCSTRING_LOCALES = 16
+LOCSTRING_FLAGS = 0x00FF01FE
+
 
 @dataclasses.dataclass(slots=True)
 class TargetField:
@@ -42,6 +47,20 @@ class TargetField:
     #: Which element, for a column that occupies several fields.
     array_index: int = 0
     array_size: int = 1
+    #: ``"locale"`` for a locstring's string slots, ``"locale_flags"`` for its
+    #: trailing mask; empty for an ordinary field.
+    role: str = ""
+    #: Bytes the field occupies.  Nearly always 4; a handful of Wrath tables
+    #: (CharStartOutfit, PowerDisplay, ...) pack some columns into bytes.
+    size: int = 4
+    is_id: bool = False
+
+    @property
+    def conventional(self) -> bool:
+        """Filled by convention rather than from a source column: the other
+        locales' empty strings, and the locale mask."""
+        return (self.role == "locale_flags"
+                or (self.role == "locale" and self.array_index > 0))
 
     @property
     def label(self) -> str:
@@ -65,6 +84,16 @@ class TargetLayout:
     @property
     def field_count(self) -> int:
         return len(self.fields)
+
+    @property
+    def id_index(self) -> int:
+        """Where the row id sits; the first field when nothing says."""
+        return next((f.index for f in self.fields if f.is_id), 0)
+
+    @property
+    def narrow_fields(self) -> list[TargetField]:
+        """Fields that are not four bytes wide."""
+        return [f for f in self.fields if f.size != 4]
 
     def by_name(self, name: str, array_index: int = 0) -> TargetField | None:
         lowered = name.lower()
@@ -111,12 +140,27 @@ def layout_from_dbd(definition: dbd.Definition,
     out = TargetLayout(origin=f"dbd:{definition.name}", build=matched)
     index = 0
     for column in layout.columns:
-        if column.relation:
+        if column.non_inline:
             continue
         kind = _dbc_type(column)
+        if column.localized:
+            # The modern column's single string is slot 0 (enUS).
+            for element in range(LOCSTRING_LOCALES):
+                out.fields.append(TargetField(index, column.name, "string",
+                                              element, LOCSTRING_LOCALES + 1,
+                                              role="locale"))
+                index += 1
+            out.fields.append(TargetField(index, column.name, "uint",
+                                          LOCSTRING_LOCALES,
+                                          LOCSTRING_LOCALES + 1,
+                                          role="locale_flags"))
+            index += 1
+            continue
+        size = 4 if kind in ("float", "string") else max(1, column.bit_width // 8)
         for element in range(max(1, column.array_size)):
             out.fields.append(TargetField(index, column.name, kind, element,
-                                          max(1, column.array_size)))
+                                          max(1, column.array_size),
+                                          size=size, is_id=column.is_id))
             index += 1
     return out
 
@@ -144,6 +188,12 @@ def auto_map(target: TargetLayout, source_columns: list[dbd.Column],
     Only columns whose types agree are matched: a modern ``FileDataID`` integer
     and a Wrath ``ModelName`` string describe the same thing but need a
     transform, and that has to be written down rather than guessed at.
+
+    Signedness is not a disagreement.  Both are the same four bytes, and the
+    two builds often declare one column differently -- 12.1 packs
+    ``CreatureDisplayInfo.ModelID`` as ``u16`` where Wrath has a plain int --
+    so requiring it to match left that column, the one linking a display to
+    its model, written as zero on every row.
     """
     by_name = {c.name.lower(): c for c in source_columns}
     out: list[AutoColumn] = []
@@ -153,12 +203,17 @@ def auto_map(target: TargetLayout, source_columns: list[dbd.Column],
         column = by_name.get(field.name.lower())
         if column is None:
             continue
-        if _dbc_type(column) != field.type:
+        if not _compatible(_dbc_type(column), field.type):
             continue
         if field.array_index >= max(1, column.array_size):
             continue
         out.append(AutoColumn(field, column.name, field.array_index))
     return out
+
+
+def _compatible(source: str, target: str) -> bool:
+    integers = ("int", "uint")
+    return source == target or (source in integers and target in integers)
 
 
 def describe(target: TargetLayout) -> str:

@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import dataclasses
 import struct
-from typing import Iterator, Sequence
+from collections.abc import Iterator, Sequence
 
 from ..chunks import Chunk, ChunkReader
 from ..errors import MalformedFileError, UnsupportedFormatError
-from ..limits import M2_GLOBAL_FLAG_USE_COMBINER_COMBOS, M2_MAGIC
+from ..limits import (
+    M2_GLOBAL_FLAG_USE_COMBINER_COMBOS,
+    M2_MAGIC,
+    M2_PARTICLE_FLAG_COMPRESSED_GRAVITY,
+)
 from . import schemas
 from .types import Schema, StructReader, Track, TrackBase
 
@@ -139,6 +143,11 @@ class M2Model:
     geometry_particle_file_ids: list[int] = dataclasses.field(default_factory=list)
     phys_file_id: int = 0
     skeleton_file_id: int = 0
+    #: Set when the bones / attachments were merged in from a ``.skel``.  Their
+    #: external keyframes then live in the ``.anim``'s ``AFSB`` / ``AFSA``
+    #: chunk rather than in ``AFM2`` with the model's own tracks.
+    bones_from_skeleton: bool = False
+    attachments_from_skeleton: bool = False
     #: Chunks present in the source that this tool does not translate.
     extra_chunks: dict[str, int] = dataclasses.field(default_factory=dict)
 
@@ -151,16 +160,27 @@ class M2Model:
     def uses_external_skeleton(self) -> bool:
         return bool(self.skeleton_file_id) and not self.bones
 
-    def tracks(self) -> "Iterator[Track | TrackBase]":
+    def tracks(self) -> Iterator[Track | TrackBase]:
         """Every animation track in the model, wherever it is nested."""
-        groups = (self.bones, self.colors, self.texture_weights,
-                  self.texture_transforms, self.attachments, self.events,
-                  self.lights, self.cameras, self.ribbons, self.particles)
-        for group in groups:
-            for item in group:
-                for value in item.values():
-                    if isinstance(value, (Track, TrackBase)):
-                        yield value
+        return tracks_in(self.bones, self.colors, self.texture_weights,
+                         self.texture_transforms, self.attachments, self.events,
+                         self.lights, self.cameras, self.ribbons, self.particles)
+
+    def bone_tracks(self) -> Iterator[Track | TrackBase]:
+        return tracks_in(self.bones)
+
+    def attachment_tracks(self) -> Iterator[Track | TrackBase]:
+        return tracks_in(self.attachments)
+
+    def own_tracks(self) -> Iterator[Track | TrackBase]:
+        """The tracks whose external keyframes sit in an ``.anim``'s ``AFM2``:
+        everything except what a skeleton contributed."""
+        return tracks_in(
+            () if self.bones_from_skeleton else self.bones,
+            self.colors, self.texture_weights, self.texture_transforms,
+            () if self.attachments_from_skeleton else self.attachments,
+            self.events, self.lights, self.cameras, self.ribbons,
+            self.particles)
 
     def describe(self) -> str:
         return (f"M2 v{self.version} '{self.name}' "
@@ -171,6 +191,15 @@ class M2Model:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def tracks_in(*groups: Sequence[dict]) -> Iterator[Track | TrackBase]:
+    """Every track held by the structs in ``groups``."""
+    for group in groups:
+        for item in group:
+            for value in item.values():
+                if isinstance(value, (Track, TrackBase)):
+                    yield value
+
+
 def _array_header(data: bytes, pos: int) -> tuple[int, int]:
     return struct.unpack_from("<II", data, pos)
 
@@ -187,6 +216,44 @@ def _read_structs(sr: StructReader, schema: Schema, data: bytes,
             f"({len(data)} bytes)"
         )
     return [sr.read_struct(schema, offset + i * schema.size) for i in range(count)]
+
+
+def _reread_packed_gravity(sr: StructReader, data: bytes, particles: list[dict],
+                           schema: Schema) -> None:
+    """Read gravity as packed vectors on the emitters that store it that way.
+
+    The keys are the same four bytes either way, but read as floats a packed
+    vector is garbage (often a NaN), and a NaN's bits do not survive a trip
+    through a Python float.  So they are read again, as the integers they are.
+    """
+    flagged = [i for i, p in enumerate(particles)
+               if p.get("flags", 0) & M2_PARTICLE_FLAG_COMPRESSED_GRAVITY]
+    if not flagged:
+        return
+    _count, offset = _array_header(data, _H["particles"])
+    field = next(off for name, _kind, off in schema.layout if name == "gravity")
+    for i in flagged:
+        particles[i]["gravity"] = sr.read_track(
+            "gravity_packed", offset + i * schema.size + field)
+
+
+def _plausible_camera(c: dict) -> int:
+    """Crude score for a candidate camera parse; 8 when every field is sane.
+
+    Wrath's scalar field of view sits between the type and the clip planes,
+    so a camera read with the other era's layout takes the far clip for the
+    field of view and the near clip for the far one.
+    """
+    score = 0
+    near, far = c.get("near_clip", -1.0), c.get("far_clip", -1.0)
+    if isinstance(near, float) and 0.0 < near <= 100.0:
+        score += 3
+    if isinstance(far, float) and isinstance(near, float) and near < far < 1e7:
+        score += 3
+    fov = c.get("fov")
+    if fov is None or (isinstance(fov, float) and 0.0 < fov < 3.2):
+        score += 2
+    return score
 
 
 def _plausible_particle(p: dict) -> int:
@@ -223,13 +290,14 @@ def _read_variable_structs(sr: StructReader, data: bytes, pos: int,
     for schema in candidates:
         try:
             items = _read_structs(sr, schema, data, pos)
-        except (MalformedFileError, ValueError, struct.error) as exc:
-            errors.append(f"{schema.name}: {exc}")
+        except (MalformedFileError, ValueError, struct.error, MemoryError) as exc:
+            # A misaligned read can take any four bytes for an array count.
+            errors.append(f"{schema.name}: {type(exc).__name__} {exc}")
             continue
         if schema.name.startswith("M2Particle"):
             score = sum(_plausible_particle(p) for p in items)
         else:
-            score = 1
+            score = sum(_plausible_camera(c) for c in items)
         if best is None or score > best[0]:
             best = (score, items, schema)
         # A first candidate that parses perfectly needs no second opinion.
@@ -250,6 +318,14 @@ def _read_variable_structs(sr: StructReader, data: bytes, pos: int,
 #: model.  This is the test the client itself makes, and it is only consulted
 #: for a chunked model that has no AFID to be exact about it.
 SEQUENCE_EMBEDDED_FLAGS = 0x130
+
+#: The one of those a 3.3.5a file uses: its keyframes are in the model.
+SEQUENCE_EMBEDDED_FLAG = 0x20
+
+#: An M2Sequence with this bit plays another sequence's keyframes: the one its
+#: ``alias_next`` names.  Its own sub-arrays, where it has any, are the same
+#: spans as that sequence's, into the same ``.anim``.
+SEQUENCE_ALIAS_FLAG = 0x40
 
 
 def external_sequences(sequences: Sequence[dict],
@@ -350,6 +426,7 @@ def parse_md20(data: bytes, name: str = "<m2>",
     m.ribbons = _read_structs(sr, schemas.RIBBON, data, _H["ribbons"])
     m.particles, m.particle_schema = _read_variable_structs(
         sr, data, _H["particles"], schemas.particle_candidates(version))
+    _reread_packed_gravity(sr, data, m.particles, m.particle_schema)
 
     if m.uses_combiner_combos and len(data) >= HEADER_SIZE_WITH_COMBINERS:
         m.texture_combiner_combos = sr.read_array("u16",

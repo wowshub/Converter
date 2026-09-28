@@ -19,7 +19,7 @@ Node layout (16 bytes)::
 from __future__ import annotations
 
 import struct
-from typing import Sequence
+from collections.abc import Sequence
 
 NODE_SIZE = 16
 

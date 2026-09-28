@@ -3,20 +3,28 @@
 import json
 import struct
 
+import db_fixtures as DF
 import pytest
 
-import db_fixtures as DF
 from wotlkconv.db.convert import convert_db2, find_template, table_name_for
 from wotlkconv.db.db2 import inspect_db2, parse_db2
 from wotlkconv.db.dbc import DbcBuilder, DbcTable, inspect_dbc
 from wotlkconv.db.dbd import DbdIndex, parse_definition
-from wotlkconv.db.mapping import (MappingLibrary, TableMapping,
-                                  TransformContext, apply_row,
-                                  missing_sources, resolve_columns)
-from wotlkconv.db.target import (auto_map, cross_check, layout_from_dbd,
-                                 layout_from_field_count)
-from wotlkconv.errors import (ConversionError, MalformedFileError,
-                              MissingDependencyError, UnsupportedFormatError)
+from wotlkconv.db.mapping import (
+    MappingLibrary,
+    TableMapping,
+    TransformContext,
+    apply_row,
+    missing_sources,
+    resolve_columns,
+)
+from wotlkconv.db.target import auto_map, cross_check, layout_from_dbd, layout_from_field_count
+from wotlkconv.errors import (
+    ConversionError,
+    MalformedFileError,
+    MissingDependencyError,
+    UnsupportedFormatError,
+)
 from wotlkconv.listfile import Listfile
 from wotlkconv.options import Options
 from wotlkconv.report import Status
@@ -182,12 +190,29 @@ def test_relationship_column(defs_dir):
     columns = [DF.Col("ID", "int", 32, is_id=True), DF.Col("V", "int", 32)]
     text = DF.build_dbd("Rel", columns, "1FE1BDA4")
     text = text.replace("COLUMNS\nint ID", "COLUMNS\nint ID\nint Owner")
-    text = text.replace("$id$ID<32>", "$id$ID<32>\n$relation$Owner<32>")
+    text = text.replace("$id$ID<32>", "$id$ID<32>\n$noninline,relation$Owner<32>")
     (defs_dir / "Rel.dbd").write_text(text)
     raw = DF.build_wdc3(columns, [{"ID": 1, "V": 5}, {"ID": 2, "V": 6}],
                         relationship={0: 777, 1: 888})
     table = parse_db2(raw, "Rel.db2", DbdIndex(defs_dir), "Rel")
     assert table.rows[1]["Owner"] == 777 and table.rows[2]["Owner"] == 888
+
+
+def test_an_inline_relation_is_read_from_the_record(defs_dir):
+    # DBDefs writes a bare $relation$ 891 times, for foreign keys stored in the
+    # record like any other field (12.1 WMOAreaTable.WMOID).  Counting one as
+    # outside the record leaves the table a column short of its own header.
+    columns = [DF.Col("ID", "int", 32, is_id=True),
+               DF.Col("Owner", "int", 32), DF.Col("V", "int", 32)]
+    text = DF.build_dbd("InRel", columns, "1FE1BDA4")
+    text = text.replace("\nOwner<32>", "\n$relation$Owner<32>")
+    assert "$relation$Owner<32>" in text
+    (defs_dir / "InRel.dbd").write_text(text)
+    raw = DF.build_wdc3(columns, [{"ID": 1, "Owner": 40, "V": 5},
+                                  {"ID": 2, "Owner": 41, "V": 6}])
+    table = parse_db2(raw, "InRel.db2", DbdIndex(defs_dir), "InRel")
+    assert table.named
+    assert table.rows[1]["Owner"] == 40 and table.rows[2]["V"] == 6
 
 
 def test_encrypted_sections_are_reported_not_guessed(defs_dir):
@@ -270,6 +295,39 @@ def test_sparse_tables_decode_variable_records_with_inline_strings(defs_dir):
     assert table.rows[250]["Name"] == "a much longer name"
     assert table.rows[9001]["Name"] == "z" and table.rows[9001]["Tag"] == ""
     assert table.rows[100]["V"] == 7
+
+
+def test_sparse_arrays_and_utf8_strings_decode_at_their_element_widths(defs_dir):
+    # 12.1 CollectableSourceQuestSparse.QuestPosition is float[3] stored as 96
+    # bits: read 96 bits per element, it ran past its 24-byte record.  Spell
+    # stores UTF-8, and ItemSparse 133589 is "Dalapeño Pepper".
+    columns = [DF.Col("ID", "int", 32, is_id=True), DF.Col("Name", "string", 32),
+               DF.Col("Position", "float", 32, array=3), DF.Col("MapID", "int", 32)]
+    rows = [{"ID": 22715, "Name": "Dalapeño Pepper",
+             "Position": [-5910.25, -703.5, 5628.25], "MapID": 2222},
+            {"ID": 45422, "Name": "it’s", "Position": [1.0, 2.0, 3.0], "MapID": 1}]
+    raw = DF.build_sparse_wdc3(columns, rows)
+    table = parse_db2(raw, "Q.db2", index_for(defs_dir, "Q", columns), "Q")
+    assert table.rows[22715]["Name"] == "Dalapeño Pepper"
+    assert table.rows[22715]["Position"] == [-5910.25, -703.5, 5628.25]
+    assert table.rows[22715]["MapID"] == 2222
+    assert table.rows[45422]["Name"] == "it’s"
+
+
+def test_sparse_relationships_follow_the_id_list_and_name_rows_by_id(defs_dir):
+    # 12.1's order is offset map, the map's id list, *then* relationships; and
+    # an entry names its row by id (ids 22715..45422 with 15,172 records).
+    columns = [DF.Col("ID", "int", 32, is_id=True), DF.Col("V", "int", 32)]
+    text = DF.build_dbd("R", columns, "1FE1BDA4").replace(
+        "COLUMNS\nint ID", "COLUMNS\nint ID\nint InfoID").replace(
+        "$id$ID<32>", "$id$ID<32>\n$noninline,relation$InfoID<32>")
+    (defs_dir / "R.dbd").write_text(text)
+    rows = [{"ID": 22715, "V": 5}, {"ID": 30000, "V": 6}, {"ID": 45422, "V": 7}]
+    raw = DF.build_sparse_wdc3(columns, rows,
+                               relationship={22715: 900, 30000: 901, 45422: 902})
+    table = parse_db2(raw, "R.db2", DbdIndex(defs_dir), "R")
+    assert [table.rows[i]["InfoID"] for i in (22715, 30000, 45422)] == [900, 901, 902]
+    assert [table.rows[i]["V"] for i in (22715, 30000, 45422)] == [5, 6, 7]
 
 
 def test_a_definition_that_does_not_fit_a_sparse_record_fails(defs_dir):
@@ -380,6 +438,9 @@ WOTLK_MODEL_COLUMNS = [
     DF.Col("CollisionWidth", "float", 32),
     DF.Col("CollisionHeight", "float", 32),
     DF.Col("MountHeight", "float", 32),
+    # Six named fields in Wrath; one float[6] in modern builds.
+    *(DF.Col(f"GeoBox{end}{axis}", "float", 32)
+      for end in ("Min", "Max") for axis in "XYZ"),
 ]
 
 
@@ -452,7 +513,7 @@ def test_builtin_mappings_load_and_describe_only_exceptions():
         assert mapping.columns, f"{name} maps nothing"
         for column in mapping.columns:
             assert column.target or column.index is not None
-            assert column.source or column.const is not None
+            assert column.source or column.const is not None or column.resolve
         # The layout is derived, not declared, so no field count is carried.
         assert not mapping.target_field_count
 
@@ -577,14 +638,15 @@ MODEL_COLUMNS = [
     DF.Col("CollisionWidth", "float", 32),
     DF.Col("MountHeight", "float", 32),
     DF.Col("SoundID", "int", 32),
+    DF.Col("GeoBox", "float", 32, array=6),
 ]
 MODEL_ROWS = [
     {"ID": 5001, "FileDataID": 1394961, "Flags": 2, "ModelScale": 1.25,
      "CollisionHeight": 3.0, "CollisionWidth": 1.5, "MountHeight": 2.5,
-     "SoundID": 77},
+     "SoundID": 77, "GeoBox": [-1.0, -2.0, -0.5, 1.0, 2.0, 3.5]},
     {"ID": 5002, "FileDataID": 1394970, "Flags": 1, "ModelScale": 0.5,
      "CollisionHeight": 1.2, "CollisionWidth": 0.8, "MountHeight": 0.0,
-     "SoundID": 0},
+     "SoundID": 0, "GeoBox": [0.0] * 6},
 ]
 #: Index of each column in the derived 3.3.5a layout.
 W = {c.name: i for i, c in enumerate(WOTLK_MODEL_COLUMNS)}
@@ -658,12 +720,12 @@ def test_a_table_with_no_mapping_converts_by_name_alone(defs_dir,
                                                         model_listfile):
     columns = [DF.Col("ID", "int", 32, is_id=True), DF.Col("MapID", "int", 32),
                DF.Col("AreaName", "string", 32)]
-    wotlk = columns + [DF.Col("Extra", "int", 32)]
-    (defs_dir / "AreaTable.dbd").write_text(
-        DF.build_dbd("AreaTable", columns, "ABCD1234", wotlk_columns=wotlk))
+    wotlk = [*columns, DF.Col("Extra", "int", 32)]
+    (defs_dir / "WorldSafeLocs.dbd").write_text(
+        DF.build_dbd("WorldSafeLocs", columns, "ABCD1234", wotlk_columns=wotlk))
     raw = DF.build_wdc3(columns, [{"ID": 1, "MapID": 0, "AreaName": "Elwynn"}],
                         layout_hash=0xABCD1234)
-    out, res = convert_db2(raw, "AreaTable.db2", Options(), model_listfile,
+    out, res = convert_db2(raw, "WorldSafeLocs.db2", Options(), model_listfile,
                            DbdIndex(defs_dir))
     assert res.ok
     table = DbcTable.parse(out, "o.dbc")
@@ -676,11 +738,13 @@ def test_a_table_absent_from_wrath_is_refused(defs_dir, model_listfile):
     (defs_dir / "SpellMisc.dbd").write_text(
         DF.build_dbd("SpellMisc", columns, "ABCD1234"))
     raw = DF.build_wdc3(columns, [{"ID": 1, "V": 2}], layout_hash=0xABCD1234)
-    _out, res = convert_db2(raw, "SpellMisc.db2", Options(), model_listfile,
-                            DbdIndex(defs_dir))
-    assert res.status is Status.FAILED
-    message = next(n.message for n in res.notes if n.level == "error")
-    assert "did not exist in Wrath" in message
+    out, res = convert_db2(raw, "SpellMisc.db2", Options(), model_listfile,
+                           DbdIndex(defs_dir))
+    # Nothing to write into is a skip: 951 of 12.1's tables have no Wrath
+    # layout, and not one of them is among a clean 3.3.5a client's tables.
+    assert out == b"" and res.status is Status.SKIPPED
+    message = next(n.message for n in res.notes if n.code == "db2.not_in_wrath")
+    assert "did not exist in 3.3.5a" in message
 
 
 def test_merging_keeps_existing_rows_and_offsets_new_ids(model_db2,
@@ -956,7 +1020,7 @@ def test_cli_db_convert_keeps_an_existing_file_without_overwrite(db_cli_tree,
             "-l", str(db_cli_tree / "listfile.csv")]
     assert main(args) == 0
     assert (out / "CreatureModelData.dbc").read_bytes() == b"SENTINEL"
-    assert main(args + ["--overwrite"]) == 0
+    assert main([*args, "--overwrite"]) == 0
     assert (out / "CreatureModelData.dbc").read_bytes() != b"SENTINEL"
 
 
@@ -974,3 +1038,351 @@ def test_a_malformed_where_clause_is_rejected():
                                                       ("Name", "bear")]
     with pytest.raises(ConverterError, match="COLUMN=VALUE"):
         _parse_where(["Flags"])
+
+
+# ---------------------------------------------------------------------------
+# What a real build (12.1.0.69814) showed the synthetic tables had wrong
+# ---------------------------------------------------------------------------
+REAL_DBD = """COLUMNS
+int ID
+string Directory
+locstring MapName_lang
+int Flags
+float GeoBox
+int LoadingScreenID
+
+LAYOUT 2F2A5E1C
+BUILD 12.1.0.69814
+$noninline,id$ID<32>
+Directory
+MapName_lang
+Flags<32>[2]
+GeoBox[6]
+
+BUILD 3.3.0.10958-3.3.5.12340
+$id$ID<32>
+Directory
+MapName_lang
+LoadingScreenID<32>
+"""
+
+
+def test_a_dbc_era_block_without_a_layout_hash_is_its_own_layout():
+    # Every Wrath block in DBDefs starts straight with BUILD.  Folded into the
+    # block above it, Map derived 166 fields instead of 66.
+    definition = parse_definition(REAL_DBD, "Map")
+    wrath = definition.by_build("3.3.5.12340")
+    modern = definition.by_hash("2F2A5E1C")
+    assert wrath is not None and wrath is not modern
+    assert [c.name for c in wrath.columns] == ["ID", "Directory",
+                                               "MapName_lang", "LoadingScreenID"]
+    assert [c.name for c in modern.columns] == ["ID", "Directory",
+                                                "MapName_lang", "Flags", "GeoBox"]
+
+
+def test_a_dbc_era_block_before_any_layout_is_not_dropped():
+    text = REAL_DBD.replace("LAYOUT 2F2A5E1C\nBUILD 12.1.0.69814\n", "")
+    text = ("COLUMNS\nint ID\nstring Directory\n\n"
+            "BUILD 3.3.5.12340\n$id$ID<32>\nDirectory\n\n"
+            "LAYOUT 2F2A5E1C\nBUILD 12.1.0.69814\n$noninline,id$ID<32>\nDirectory\n")
+    definition = parse_definition(text, "T")
+    assert [c.name for c in definition.by_build("3.3.5.12340").columns] == [
+        "ID", "Directory"]
+
+
+def test_a_wrath_locstring_is_sixteen_strings_and_a_mask():
+    # Every one of 245 real tables matched only once this was right.
+    target = layout_from_dbd(parse_definition(REAL_DBD, "Map"))
+    assert target.field_count == 1 + 1 + 17 + 1
+    name = [f for f in target.fields if f.name == "MapName_lang"]
+    assert [f.role for f in name] == ["locale"] * 16 + ["locale_flags"]
+    assert name[-1].type == "uint" and target.by_name("LoadingScreenID").index == 19
+
+
+def test_a_converted_locstring_fills_enus_and_the_mask(tmp_path):
+    columns = [DF.Col("ID", "int", 32, is_id=True),
+               DF.Col("Directory", "string", 32),
+               DF.Col("MapName_lang", "string", 32)]
+    text = DF.build_dbd("Map", columns, "1FE1BDA4")
+    text = text.replace("string MapName_lang", "locstring MapName_lang")
+    text += "\nBUILD 3.3.5.12340\n$id$ID<32>\nDirectory\nMapName_lang\n"
+    (tmp_path / "Map.dbd").write_text(text)
+    raw = DF.build_wdc3(columns, [{"ID": 571, "Directory": "Northrend",
+                                   "MapName_lang": "Northrend"}])
+    out, res = convert_db2(raw, "Map.db2", Options(), Listfile(),
+                           DbdIndex(tmp_path))
+    table = DbcTable.parse(out, "Map.dbc")
+    assert table.field_count == 19
+    assert table.value(0, 2, "string") == "Northrend"
+    assert all(table.word(0, i) == 0 for i in range(3, 18))
+    assert table.word(0, 18) == 0x00FF01FE
+    unmapped = next((n for n in res.notes if n.code == "db2.columns_unmapped"),
+                    None)
+    assert unmapped is None                   # conventional slots are not gaps
+
+
+def test_a_table_with_byte_wide_wrath_fields_is_written_at_those_widths(tmp_path):
+    # PowerDisplay in a clean 3.3.5a client: 6 fields in 15-byte records.  The
+    # definitions' widths reproduce every one of that client's 245 tables.
+    columns = [DF.Col("ID", "int", 32, is_id=True),
+               DF.Col("ActualType", "int", 32), DF.Col("Red", "int", 32),
+               DF.Col("Green", "int", 32)]
+    text = DF.build_dbd("PowerDisplay", columns, "1FE1BDA4")
+    text += "\nBUILD 3.3.5.12340\n$id$ID<32>\nActualType<32>\nRed<u8>\nGreen<u8>\n"
+    (tmp_path / "PowerDisplay.dbd").write_text(text)
+    raw = DF.build_wdc3(columns, [{"ID": 1, "ActualType": 7, "Red": 255, "Green": 16},
+                                  {"ID": 2, "ActualType": 3, "Red": 1, "Green": 300}])
+    out, res = convert_db2(raw, "PowerDisplay.db2", Options(), Listfile(),
+                           DbdIndex(tmp_path))
+    assert res.ok
+    assert struct.unpack_from("<4sIIII", out)[1:4] == (2, 4, 10)
+    table = DbcTable.parse(out, "p", field_sizes=[4, 4, 1, 1])
+    assert [table.word(0, i) for i in range(4)] == [1, 7, 255, 16]
+    assert table.word(1, 3) == 300 & 0xFF          # a byte column keeps its byte
+    with pytest.raises(MalformedFileError):
+        DbcTable.parse(out, "p")                    # not a four-byte layout
+
+
+def test_a_byte_wide_template_is_merged_at_its_own_widths(tmp_path):
+    columns = [DF.Col("ID", "int", 32, is_id=True), DF.Col("Red", "int", 32)]
+    text = DF.build_dbd("PowerDisplay", columns, "1FE1BDA4")
+    text += "\nBUILD 3.3.5.12340\n$id$ID<32>\nRed<u8>\n"
+    (tmp_path / "PowerDisplay.dbd").write_text(text)
+    template = (struct.pack("<4sIIII", b"WDBC", 1, 2, 5, 1)
+                + struct.pack("<IB", 9, 200) + bytes(1))
+    raw = DF.build_wdc3(columns, [{"ID": 1, "Red": 255}])
+    out, res = convert_db2(raw, "PowerDisplay.db2", Options(), Listfile(),
+                           DbdIndex(tmp_path), template_data=template)
+    assert res.ok
+    table = DbcTable.parse(out, "p", field_sizes=[4, 1])
+    assert sorted((table.word(r, 0), table.word(r, 1)) for r in range(2)) == \
+        [(1, 255), (9, 200)]
+
+
+def test_an_unsigned_value_past_two_to_the_31_fits_a_signed_field():
+    builder = DbcBuilder(1)
+    builder.add({0: ("int", 0xFFFFFFFB)}, row_id=1)
+    assert DbcTable.parse(builder.serialize(), "t").value(0, 0, "int") == -5
+
+
+def test_signedness_does_not_stop_a_column_mapping_itself():
+    # 12.1 CreatureDisplayInfo.ModelID is u16; Wrath's is a plain int.  Refusing
+    # the match left the display-to-model link zero on every row.
+    columns = [DF.Col("ID", "int", 32, is_id=True),
+               DF.Col("ModelID", "int", 16, signed=False)]
+    wrath = [DF.Col("ID", "int", 32, is_id=True), DF.Col("ModelID", "int", 32)]
+    definition = parse_definition(
+        DF.build_dbd("T", columns, "A1", wotlk_columns=wrath), "T")
+    target = layout_from_dbd(definition)
+    matched = auto_map(target, definition.by_hash("A1").columns, set())
+    assert {m.source for m in matched} == {"ID", "ModelID"}
+
+
+def test_strings_count_from_the_records_of_every_section(defs_dir):
+    # A table with an encrypted section of unreleased rows has two sections;
+    # measuring from the first alone read 'ay' for Dun Morogh.
+    columns = [DF.Col("ID", "int", 32, is_id=True),
+               DF.Col("Name", "string", 32), DF.Col("V", "int", 32)]
+    rows = [{"ID": 1, "Name": "Dun Morogh", "V": 5},
+            {"ID": 12, "Name": "Elwynn Forest", "V": 6}]
+    raw = DF.build_wdc3(columns, rows, magic="WDC5", encrypted_rows=3)
+    table = parse_db2(raw, "A.db2", index_for(defs_dir, "A", columns), "A")
+    assert table.encrypted_sections == 1 and table.skipped_records == 3
+    assert table.rows[1]["Name"] == "Dun Morogh"
+    assert table.rows[12]["Name"] == "Elwynn Forest"
+
+
+def test_a_pallet_value_is_cut_to_the_columns_own_width(defs_dir):
+    # 12.1 GameObjectDisplayInfo.ObjectEffectPackageID: a <16> column whose
+    # palette entries all carry 0x76 above bit 16.
+    columns = [DF.Col("ID", "int", 32, is_id=True),
+               DF.Col("Package", "int", 3, storage=DF.STORAGE_BITPACKED_INDEXED,
+                      signed=False)]
+    rows = [{"ID": 1, "Package": 0x760000 + 1629}, {"ID": 2, "Package": 0x760000}]
+    raw = DF.build_wdc3(columns, rows)
+    text = DF.build_dbd("G", columns, "1FE1BDA4").replace("Package<u32>",
+                                                         "Package<u16>")
+    (defs_dir / "G.dbd").write_text(text)
+    table = parse_db2(raw, "G.db2", DbdIndex(defs_dir), "G")
+    assert table.rows[1]["Package"] == 1629 and table.rows[2]["Package"] == 0
+
+
+def test_a_table_without_an_id_column_is_keyed_by_the_modern_id(tmp_path):
+    columns = [DF.Col("ID", "int", 32, is_id=True),
+               DF.Col("ItemButtonName", "string", 32),
+               DF.Col("SlotNumber", "int", 32)]
+    text = DF.build_dbd("PaperDollItemFrame", columns, "1FE1BDA4")
+    text += "\nBUILD 3.3.5.12340\nItemButtonName\nSlotNumber<32>\n"
+    (tmp_path / "PaperDollItemFrame.dbd").write_text(text)
+    raw = DF.build_wdc3(columns, [{"ID": 3, "ItemButtonName": "HeadSlot",
+                                   "SlotNumber": 1}])
+    out, res = convert_db2(raw, "PaperDollItemFrame.db2", Options(), Listfile(),
+                           DbdIndex(tmp_path))
+    assert res.ok
+    assert DbcTable.parse(out, "p").value(0, 0, "string") == "HeadSlot"
+
+
+def test_rows_of_a_table_without_an_id_column_do_not_collapse(tmp_path):
+    # CharBaseInfo is RaceID<u8>, ClassID<u8> in Wrath.  Keyed by its first
+    # field, every race kept only its last class: 31 rows where 62 belong.
+    columns = [DF.Col("ID", "int", 32, is_id=True), DF.Col("RaceID", "int", 32),
+               DF.Col("ClassID", "int", 32)]
+    text = DF.build_dbd("CharBaseInfo", columns, "1FE1BDA4")
+    text += "\nBUILD 3.3.5.12340\nRaceID<u8>\nClassID<u8>\n"
+    (tmp_path / "CharBaseInfo.dbd").write_text(text)
+    rows = [{"ID": i + 1, "RaceID": race, "ClassID": cls}
+            for i, (race, cls) in enumerate([(1, 1), (1, 2), (1, 4), (2, 1), (2, 3)])]
+    out, res = convert_db2(raw := DF.build_wdc3(columns, rows), "CharBaseInfo.db2",
+                           Options(), Listfile(), DbdIndex(tmp_path))
+    assert res.ok and raw
+    table = DbcTable.parse(out, "c", field_sizes=[1, 1])
+    assert sorted((table.word(r, 0), table.word(r, 1)) for r in range(len(table))) \
+        == [(1, 1), (1, 2), (1, 4), (2, 1), (2, 3)]
+
+
+def test_a_template_for_a_table_with_no_wrath_layout_is_still_an_error(tmp_path):
+    columns = [DF.Col("ID", "int", 32, is_id=True), DF.Col("V", "int", 32)]
+    (tmp_path / "Odd.dbd").write_text(DF.build_dbd("Odd", columns, "1FE1BDA4"))
+    raw = DF.build_wdc3(columns, [{"ID": 1, "V": 2}])
+    _out, res = convert_db2(raw, "Odd.db2", Options(), Listfile(),
+                            DbdIndex(tmp_path),
+                            template_data=DF.build_dbc(2, [[1, 2]]))
+    assert res.status is Status.FAILED
+    assert any(n.code == "db2.no_layout" for n in res.notes)
+
+
+# ---------------------------------------------------------------------------
+# Liquids
+# ---------------------------------------------------------------------------
+class _FrameStorage:
+    """Just enough of CascStorage: FileDataIDs and a BLP header's size."""
+
+    def __init__(self, sizes):
+        self.sizes = sizes
+
+    def __contains__(self, file_id):
+        return file_id in self.sizes
+
+    def try_read_file_id(self, file_id):
+        width, height = self.sizes[file_id]
+        return b"BLP2" + bytes(8) + struct.pack("<II", width, height), None
+
+
+def _liquid_context(frames: dict[str, int], sizes: dict[int, tuple]):
+    import types
+
+    from wotlkconv.db.mapping import TransformContext
+    lf = Listfile("<test>")
+    lf.update([f"{fid};{path}" for path, fid in frames.items()])
+    return TransformContext(lf, tables=types.SimpleNamespace(storage=_FrameStorage(sizes)))
+
+
+def _animation(pattern, first_id, count=30, size=(256, 256), odd=None):
+    frames = {pattern.replace("%d", str(k)): first_id + k for k in range(1, count + 1)}
+    sizes = {first_id + k: (odd if k == 3 and odd else size) for k in range(1, count + 1)}
+    return frames, sizes
+
+
+def test_a_liquid_with_a_complete_animation_keeps_its_textures_and_material():
+    from wotlkconv.db.mapping import RESOLVERS
+    frames, sizes = _animation("xtextures/fel/feldeep.%d.blp", 1000)
+    ctx = _liquid_context(frames, sizes)
+    row = {"SoundBank": 2, "MaterialID": 2, "Texture": ["XTextures\\fel\\feldeep.%d.blp", "", "", "", "", ""]}
+    assert RESOLVERS["liquid.texture"](row, ctx, index=0) == "XTextures\\fel\\feldeep.%d.blp"
+    assert RESOLVERS["liquid.material"](row, ctx) == 2
+
+
+@pytest.mark.parametrize("textures,frames,odd,kind,expected_material", [
+    (["xtextures\\12_venom\\12fx_venom_deep.blp"], 30, None, 2, 2),   # still textures
+    (["xtextures\\eternity\\magic_%d.blp"], 3, None, 1, 1),            # 3 frames, not 30
+    (["xtextures\\eternity\\magic_%d.blp"], 30, (1024, 1024), 0, 1),    # mixed sizes
+    ([""], 30, None, 3, 2),                                            # nothing at all
+])
+def test_a_liquid_3_3_5a_cannot_animate_gets_its_kinds_textures(textures, frames, odd, kind,
+                                                                expected_material):
+    from wotlkconv.db.liquidtypes import WRATH_TEXTURES
+    from wotlkconv.db.mapping import RESOLVERS
+    frame_ids, sizes = _animation("xtextures/eternity/magic_%d.blp", 2000, frames, odd=odd)
+    ctx = _liquid_context(frame_ids, sizes)
+    row = {"SoundBank": kind, "MaterialID": 14, "Texture": textures + [""] * 5}
+    assert tuple(RESOLVERS["liquid.texture"](row, ctx, index=i) for i in range(6)) == WRATH_TEXTURES[kind]
+    assert RESOLVERS["liquid.material"](row, ctx) == expected_material
+
+
+def test_liquid_materials_lose_the_cataclysm_vertex_format():
+    from wotlkconv.db.mapping import TRANSFORMS, TransformContext
+    fmt = TRANSFORMS["wrath_liquid_vertex_format"]
+    assert [fmt(v, TransformContext()) for v in (0, 1, 2, 3)] == [0, 1, 2, 1]
+
+
+def test_the_liquid_mappings_are_built_in():
+    library = MappingLibrary()
+    assert library.get("LiquidType").columns[0].resolve == "liquid.material"
+    assert library.get("LiquidMaterial").columns[0].transform == \
+        "wrath_liquid_vertex_format"
+
+
+# ---------------------------------------------------------------------------
+# Sky bands
+# ---------------------------------------------------------------------------
+def test_light_bands_are_rebuilt_from_light_data():
+    import struct
+
+    from wotlkconv.db.lightbands import INT_BANDS, build_light_bands
+    rows = [dict(dict.fromkeys(INT_BANDS, 0), LightParamID=2, Time=1440, SkyTopColor=0xFF112233,
+                 FogEnd=900.0, FogScaler=0.25, CloudDensity=0.5),
+            dict(dict.fromkeys(INT_BANDS, 0), LightParamID=2, Time=0, SkyTopColor=0x00445566,
+                 FogEnd=800.0, FogScaler=0.1, CloudDensity=0.4)]
+    ints, floats, counts = build_light_bands(rows, [2, 3])
+    assert counts["params"] == 2
+
+    def records(blob, fmt):
+        _, n, fields, size, _ = struct.unpack_from("<4s4I", blob, 0)
+        return {struct.unpack_from("<I", blob, 20 + i * size)[0]:
+                struct.unpack_from(fmt, blob, 20 + i * size) for i in range(n)}
+
+    int_rows = records(ints, "<34I")
+    assert len(int_rows) == 36                       # 18 bands for each param
+    sky_top = int_rows[2 * 18 - 17 + 2]
+    assert sky_top[1] == 2 and sky_top[2:4] == (0, 1440)       # keys sorted by time
+    assert sky_top[18:20] == (0x445566, 0x112233)              # top byte cleared
+    assert int_rows[3 * 18 - 17][1] == 0             # a param with no data has no keys
+    float_rows = records(floats, "<2I16I16f")
+    fog, multiplier, glow, clouds, unknown4, unknown5 = (float_rows[2 * 6 - 5 + b] for b in range(6))
+    assert fog[18:20] == (800.0, 900.0)
+    assert [round(v, 2) for v in multiplier[18:20]] == [0.1, 0.25]
+    assert [round(v, 2) for v in clouds[18:20]] == [0.4, 0.5]
+    assert glow[18:20] == (1.0, 1.0) and unknown5[18:20] == (1.0, 1.0)
+    assert [round(v, 2) for v in unknown4[18:20]] == [0.95, 0.95]
+
+
+@pytest.mark.parametrize("row,expected", [
+    ({"Name": "12ZAM Sky 01", "SkyboxFileDataID": 820001}, "environments\\stars\\sky.mdx"),
+    ({"Name": "Environments\\Stars\\Stars.mdx", "SkyboxFileDataID": 0}, "Environments\\Stars\\Stars.mdx"),
+    ({"Name": "placeholder empty skybox - morgan test", "SkyboxFileDataID": 0}, ""),
+])
+def test_skyboxes_name_their_model(row, expected, listfile):
+    from wotlkconv.db.mapping import RESOLVERS, TransformContext
+    assert RESOLVERS["lightskybox.model"](row, TransformContext(listfile)) == expected
+
+
+@pytest.mark.parametrize("row,file,wide,name", [
+    # Kalimdor: a narrow image and its "wide" twin, as 3.3.5a names them.
+    ({"NarrowScreenFileDataID": 131848, "WideScreenFileDataID": 343002},
+     "interface\\glues\\loadingscreens\\loadscreenkalimdor.blp", 1, "loadscreenkalimdor"),
+    # A modern screen with only a 16:9 image: no wide variant to derive.
+    ({"NarrowScreenFileDataID": 0, "WideScreen169FileDataID": 131848},
+     "interface\\glues\\loadingscreens\\loadscreenkalimdor.blp", 0, "loadscreenkalimdor"),
+    ({"Name": "Kalimdor", "FileName": "Interface\\Glues\\LoadScreen.blp", "HasWideScreen": 1},
+     "Interface\\Glues\\LoadScreen.blp", 1, "Kalimdor"),
+])
+def test_loading_screens_name_their_image(row, file, wide, name):
+    from wotlkconv.db.mapping import RESOLVERS, TransformContext
+    from wotlkconv.listfile import Listfile
+    lf = Listfile("<test>")
+    lf.update(["131848;interface/glues/loadingscreens/loadscreenkalimdor.blp",
+               "343002;interface/glues/loadingscreens/loadscreenkalimdorwide.blp"])
+    ctx = TransformContext(lf)
+    assert RESOLVERS["loadingscreens.file"](row, ctx) == file
+    assert RESOLVERS["loadingscreens.wide"](row, ctx) == wide
+    assert RESOLVERS["loadingscreens.name"](row, ctx) == name

@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Iterable, Iterator
 
 from . import log
 from .errors import MissingDependencyError
@@ -60,7 +60,7 @@ class Listfile:
 
     # -- construction ---------------------------------------------------
     @classmethod
-    def load(cls, path: str | os.PathLike[str]) -> "Listfile":
+    def load(cls, path: str | os.PathLike[str]) -> Listfile:
         p = Path(path)
         if not p.is_file():
             raise MissingDependencyError(f"listfile not found: {p}")
@@ -72,7 +72,7 @@ class Listfile:
 
     @classmethod
     def discover(cls, explicit: str | os.PathLike[str] | None = None,
-                 search_dirs: Iterable[str | os.PathLike[str]] = ()) -> "Listfile":
+                 search_dirs: Iterable[str | os.PathLike[str]] = ()) -> Listfile:
         """Load from an explicit path, then ``$WOTLKCONV_LISTFILE``, then probe.
 
         Returns an empty listfile rather than raising when nothing is found;
@@ -142,7 +142,9 @@ def placeholder_path(fdid: int, kind: str) -> str:
     """Deterministic stand-in path for an unresolved FileDataID.
 
     Used when the caller asked to keep converting despite an incomplete
-    listfile.  The file still loads; the reference simply points at an asset
-    the user has to supply or repoint themselves.
+    listfile.  It is the name a build gives a file it has no listfile entry
+    for, ``unknown/<id>.<ext>``, so when the file is in the build the
+    reference finds it; when it is not, the reference points at an asset the
+    user has to supply or repoint themselves.
     """
-    return normalise(f"unresolved/{kind}/{fdid}.{kind}")
+    return normalise(f"unknown/{fdid}.{kind}")

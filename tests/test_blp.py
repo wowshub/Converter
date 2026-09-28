@@ -1,12 +1,14 @@
-import pytest
+import struct
 
 import fixtures as F
+import pytest
+
 from wotlkconv.blp import bcn
-from wotlkconv.blp.blp import Blp, PreferredFormat
+from wotlkconv.blp.blp import Blp, EmptyTextureError, PreferredFormat
 from wotlkconv.blp.convert import convert_blp, inspect_blp
 from wotlkconv.blp.image import Image, is_pot, nearest_pot, next_pot, prev_pot
 from wotlkconv.blp.quantize import PaletteMapper, build_palette
-from wotlkconv.errors import UnsupportedFormatError
+from wotlkconv.errors import MalformedFileError, UnsupportedFormatError
 from wotlkconv.options import Options, TextureFormat
 from wotlkconv.report import Status
 
@@ -147,6 +149,23 @@ def test_compatible_texture_is_copied_through_bit_for_bit(opts):
     assert Blp.parse(out, "o").mips == Blp.parse(raw, "i").mips
 
 
+@pytest.mark.parametrize("fmt,declared,written", [
+    (PreferredFormat.DXT5, 72, 8),   # the depth 33 retail textures declare
+    (PreferredFormat.DXT5, 0, 8),    # 3.3.5a would decode these blocks as DXT1
+    (PreferredFormat.DXT1, 8, 1),    # ...and these as DXT3
+    (PreferredFormat.DXT3, 4, 4),    # a depth 3.3.5a's own textures use
+])
+def test_a_copied_texture_declares_an_alpha_depth_matching_its_blocks(
+        opts, fmt, declared, written):
+    data = bytearray(F.build_blp(F.build_gradient_image(16, 16), fmt))
+    data[9] = declared
+    out, res = convert_blp(bytes(data), "t.blp", opts)
+    assert res.status is Status.PASSTHROUGH
+    assert out[9] == written and out[10] == fmt
+    assert out[1172:] == bytes(data[1172:])
+    assert any(n.code == "blp.alpha_depth" for n in res.notes) == (declared != written)
+
+
 def test_bc5_normal_map_is_transcoded(opts):
     raw = F.build_bc5_blp(32, 32)
     assert inspect_blp(raw, "n.blp")["wotlk_compatible"] is False
@@ -236,3 +255,28 @@ def test_raw_bgra_textures_decode():
 def test_palette_stays_within_256_entries():
     img = F.build_gradient_image(64, 64)
     assert len(build_palette(img.data, 256)) == 256
+
+
+def _empty_placeholder_blp() -> bytes:
+    # Retail 12.1 minimap placeholders: 148-byte header, zeroed palette, and
+    # every mip offset and size zero -- 1,172 bytes with no image in them.
+    header = struct.pack("<4sIBBBBII", b"BLP2", 1, 2, 8, 0, 1, 128, 64)
+    return header + bytes(16 * 4 * 2) + bytes(256 * 4)
+
+
+def test_an_empty_placeholder_texture_is_skipped_not_failed(opts):
+    raw = _empty_placeholder_blp()
+    assert len(raw) == 1172
+    out, res = convert_blp(raw, "tile_00_00.blp", opts)
+    assert out == b""
+    assert res.status is Status.SKIPPED
+    assert [n.code for n in res.notes] == ["blp.empty"]
+
+
+def test_a_blp_whose_mips_point_nowhere_is_still_an_error():
+    raw = bytearray(_empty_placeholder_blp())
+    struct.pack_into("<I", raw, 20, 9999)          # offset past the end
+    struct.pack_into("<I", raw, 84, 512)
+    with pytest.raises(MalformedFileError) as exc:
+        Blp.parse(bytes(raw), "broken.blp")
+    assert not isinstance(exc.value, EmptyTextureError)

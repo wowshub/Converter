@@ -27,12 +27,16 @@ from .db.dbd import ENV_VAR as dbd_env
 from .errors import ConverterError
 from .limits import BLP_SOFT_MAX_DIMENSION, TARGET_BUILD, TARGET_PATCH
 from .liquid import inspect_liquid
-from .listfile import ENV_VAR, Listfile, to_posix
+from .listfile import ENV_VAR, Listfile, normalise, to_posix
 from .m2 import inspect_anim, inspect_m2, inspect_skin
 from .options import Options, TextureFormat, UnresolvedPolicy
 from .pipeline import normalise_pattern, plan, plan_casc, run
-from .report import FileResult, Report
+from .report import FileResult, Report, Status
 from .wmo import inspect_group, inspect_wmo_root
+
+#: Runs bigger than this write per-file results to disk as they arrive instead
+#: of holding them all until the report is written.
+SPOOL_THRESHOLD = 50_000
 
 _INSPECTORS = {
     detect.M2: inspect_m2,
@@ -100,6 +104,13 @@ examples:
     cg.add_argument("--casc-keys", metavar="PATH",
                     help="TACT encryption keys (a WoW.txt of "
                          "'<keyname> <key>' lines) for encrypted files")
+    cg.add_argument("--casc-cdn", action="store_true",
+                    help="fetch files this install does not store from "
+                         "Blizzard's CDN (the hosts in .build.info), verify "
+                         "each against its keys, and cache them")
+    cg.add_argument("--casc-cdn-cache", metavar="DIR",
+                    help="where --casc-cdn keeps fetched files (default: "
+                         "~/.cache/wotlkconv/cdn)")
 
     db_opts = argparse.ArgumentParser(add_help=False)
     dg = db_opts.add_argument_group("client databases")
@@ -393,17 +404,127 @@ def _open_casc(args: argparse.Namespace, search_dirs) -> tuple[object, dict]:
     """Open the install named by --casc and describe it for worker processes."""
     keys = KeyRing.discover(getattr(args, "casc_keys", None),
                             [Path(args.casc), *search_dirs])
+    cdn_cache = None
+    if getattr(args, "casc_cdn", False):
+        from .fetch import default_cache
+
+        cdn_cache = str(Path(args.casc_cdn_cache) if args.casc_cdn_cache
+                        else default_cache() / "cdn")
     storage = CascStorage.open(args.casc,
                                product=getattr(args, "casc_product", None),
                                locale=getattr(args, "casc_locale", "enus"),
-                               keys=keys)
+                               keys=keys, cdn_cache=cdn_cache)
+    if cdn_cache:
+        log.info(f"files this install does not store will be fetched from "
+                 f"the CDN and cached in {cdn_cache}")
     casc_args = {
         "path": str(args.casc),
         "product": getattr(args, "casc_product", None),
         "locale": getattr(args, "casc_locale", "enus"),
         "keys": keys.sources[0] if keys.sources else None,
+        "cdn_cache": cdn_cache,
     }
     return storage, casc_args
+
+
+def _item_display_aliases(jobs, definitions, storage, listfile,
+                          convert_databases: bool) -> dict[int, set[str]]:
+    """Extra names for the item files a converted ItemDisplayInfo refers to.
+
+    Worked out once, before the workers start, from the same joins the table's
+    conversion uses -- so a name in the .dbc and a file on disk agree.
+    """
+    from .db.convert import table_name_for
+
+    table_jobs = [j for j in jobs if j.kind == detect.DB2
+                  and table_name_for(j.relpath).lower() == "itemdisplayinfo"]
+    if not convert_databases or not table_jobs:
+        return {}
+    from .db.itemdisplay import ItemDisplayResolver
+    from .db.tables import TableProvider
+
+    source = table_jobs[0].source
+    provider = TableProvider(definitions, storage=storage, listfile=listfile,
+                             directory=source.parent if source else None)
+    aliases = ItemDisplayResolver(provider, listfile).asset_aliases()
+    provider.clear()
+    log.info(f"{sum(len(v) for v in aliases.values())} item file name(s) will "
+             f"also be written where 3.3.5a's ItemDisplayInfo looks for them")
+    return aliases
+
+
+def _ground_doodad_aliases(jobs, definitions, storage, listfile,
+                           convert_databases: bool) -> dict[int, set[str]]:
+    """Copies of ground clutter models the converted GroundEffectDoodad
+    expects in the detail folder; see :mod:`.db.grounddoodad`."""
+    from .db.convert import table_name_for
+
+    table_jobs = [j for j in jobs if j.kind == detect.DB2
+                  and table_name_for(j.relpath).lower() == "groundeffectdoodad"]
+    if not convert_databases or not table_jobs:
+        return {}
+    from .db.grounddoodad import GroundDoodadNames
+    from .db.tables import TableProvider
+
+    source = table_jobs[0].source
+    provider = TableProvider(definitions, storage=storage, listfile=listfile,
+                             directory=source.parent if source else None)
+    aliases = GroundDoodadNames(provider, listfile).aliases()
+    provider.clear()
+    log.info(f"{len(aliases)} ground clutter model(s) will also be written where "
+             f"3.3.5a's GroundEffectDoodad looks for them")
+    return aliases
+
+
+def _without_other_files(aliases: dict[int, set[str]], jobs) -> dict[int, set[str]]:
+    """Drop the extra names that another file in the build is written under.
+
+    A name joined from the databases can coincide with a different file's own
+    path (an icon and a cape texture share a basename), and whichever was
+    written first would keep the name: the real file must win.
+    """
+    owners = {normalise(j.relpath): j.file_id for j in jobs if j.file_id is not None}
+    kept: dict[int, set[str]] = {}
+    dropped = 0
+    for file_id, names in aliases.items():
+        own = {n for n in names if owners.get(normalise(n), file_id) == file_id}
+        dropped += len(names) - len(own)
+        if own:
+            kept[file_id] = own
+    if dropped:
+        log.info(f"{dropped} database file name(s) belong to another file in the "
+                 f"build, which keeps them")
+    return kept
+
+
+def _write_minimap_index(jobs, storage, listfile, definitions, out_dir: Path) -> None:
+    """Write md5translate.trs for every minimap tile in the build.
+
+    Only when this run converted minimap tiles, so a narrowed run that did not
+    touch them leaves an existing index alone.
+    """
+    from .minimap import TRANSLATE_PATH, build_translate, minimap_entry
+
+    if not any(minimap_entry(j.relpath) for j in jobs):
+        return
+    if storage is not None and listfile:
+        paths = [p for fid, p in listfile
+                 if minimap_entry(p) is not None and fid in storage]
+    else:
+        paths = [j.relpath for j in jobs]
+    directories: dict[str, str] = {}
+    if storage is not None and definitions:
+        from .db.tables import TableProvider
+        maps = TableProvider(definitions, storage=storage, listfile=listfile).get("Map")
+        if maps is not None:
+            directories = {str(r["Directory"]).lower(): str(r["Directory"])
+                           for r in maps.rows.values() if r.get("Directory")}
+    data = build_translate(paths, directories)
+    target = out_dir / to_posix(TRANSLATE_PATH)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    tiles = data.count(b"\t")
+    log.info(f"wrote {target}: {tiles} minimap tile(s) indexed")
 
 
 def cmd_convert(args: argparse.Namespace) -> int:
@@ -452,11 +573,12 @@ def cmd_convert(args: argparse.Namespace) -> int:
         # partial install is normal, and the files it lacks would otherwise
         # turn up as a pile of read failures at the end of a long run.
         coverage = storage.coverage(sample=COVERAGE_SAMPLE)
-        if coverage.not_downloaded:
+        if coverage.not_downloaded and storage.cdn is not None:
+            log.info(f"{coverage.describe()}; --casc-cdn fetches those")
+        elif coverage.not_downloaded:
             log.warn(f"{coverage.describe()}. Nothing is fetched from the "
                      f"CDN, so files that are not on disk will be reported "
-                     f"as not installed. Run the game's own updater if you "
-                     f"need them")
+                     f"as not installed. Pass --casc-cdn to fetch them")
         else:
             log.info(coverage.describe())
         cjobs, cskipped = plan_casc(
@@ -486,10 +608,24 @@ def cmd_convert(args: argparse.Namespace) -> int:
     log.info(f"converting {len(jobs)} file(s) to {args.out}"
              + (" (dry run)" if opts.dry_run else ""))
 
+    # A big run spools its per-file results to disk rather than holding them;
+    # with no report asked for, only the counts are kept at all.
+    spool = None
+    if len(jobs) + len(skipped) > SPOOL_THRESHOLD:
+        spool = (str(Path(args.report).with_suffix(".results.jsonl"))
+                 if args.report else os.devnull)
+    aliases = _item_display_aliases(jobs, definitions, storage, listfile,
+                                    convert_databases)
+    for fid, names in _ground_doodad_aliases(jobs, definitions, storage, listfile,
+                                             convert_databases).items():
+        aliases.setdefault(fid, set()).update(names)
+    aliases = _without_other_files(aliases, jobs)
     report = run(jobs, opts, listfile, args.out, roots=roots,
                  listfile_path=listfile.source if listfile else None,
                  skipped=skipped, storage=storage, casc_args=casc_args,
-                 definitions=definitions)
+                 definitions=definitions, spool=spool, aliases=aliases)
+    if not opts.dry_run:
+        _write_minimap_index(jobs, storage, listfile, definitions, Path(args.out))
     if storage is not None:
         storage.close()
 
@@ -498,8 +634,10 @@ def cmd_convert(args: argparse.Namespace) -> int:
     if args.report:
         report.write_json(args.report)
         log.info(f"wrote report to {args.report}")
+    if spool and spool != os.devnull:
+        Path(spool).unlink(missing_ok=True)
 
-    lossy = len(report.lossy)
+    lossy = report.counts().get(Status.LOSSY.value, 0)
     if lossy and args.verbose < 1:
         print(f"{lossy} file(s) converted with losses; re-run with -v (or "
               f"--report) to see what changed")
@@ -662,12 +800,14 @@ def cmd_build(args: argparse.Namespace) -> int:
     cache = Path(args.cache_dir) if args.cache_dir else None
 
     if args.fetch:
-        from .fetch import fetch_definitions, fetch_listfile
+        from .fetch import fetch_definitions, fetch_keys, fetch_listfile
 
         if not args.listfile:
             args.listfile = str(fetch_listfile(cache))
         if not args.dbd:
             args.dbd = str(fetch_definitions(cache))
+        if args.casc and not args.casc_keys:
+            args.casc_keys = str(fetch_keys(cache))
 
     # The whole build is the point of the command; --include narrows it.
     if args.casc and not args.include and not args.fileid \

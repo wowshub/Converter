@@ -7,7 +7,7 @@ rather than carrying an endianness parameter around.
 from __future__ import annotations
 
 import struct
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 from .errors import TruncatedFileError
 
@@ -28,7 +28,7 @@ class Reader:
     created once for the whole file and ``seek``-ed around rather than sliced.
     """
 
-    __slots__ = ("data", "pos", "name")
+    __slots__ = ("data", "name", "pos")
 
     def __init__(self, data: bytes, name: str = "<memory>", pos: int = 0):
         self.data = data
@@ -39,15 +39,15 @@ class Reader:
     def __len__(self) -> int:
         return len(self.data)
 
-    def seek(self, pos: int) -> "Reader":
+    def seek(self, pos: int) -> Reader:
         self.pos = pos
         return self
 
-    def skip(self, count: int) -> "Reader":
+    def skip(self, count: int) -> Reader:
         self.pos += count
         return self
 
-    def at(self, pos: int) -> "Reader":
+    def at(self, pos: int) -> Reader:
         """Return an independent cursor over the same buffer."""
         return Reader(self.data, self.name, pos)
 

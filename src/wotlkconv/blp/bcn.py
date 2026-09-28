@@ -12,7 +12,7 @@ precomputed tables and local-variable binding rather than numpy.
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 # ---------------------------------------------------------------------------
 # 5/6-bit <-> 8-bit colour conversion tables

@@ -71,10 +71,20 @@ M2_GLOBAL_FLAG_USE_COMBINER_COMBOS = 0x08
 #: M2Texture.type values 3.3.5a resolves at runtime. Anything higher is Cata+.
 M2_MAX_TEXTURE_TYPE = 15
 
-#: M2Particle.flags bits above this are Cataclysm-and-later additions, chief
-#: among them 0x10000000 (multi-texture emitters).
-M2_PARTICLE_FLAG_MASK = 0x0FFFFFFF
+#: M2Particle.flags bits 3.3.5a's own emitters use: 0x1 through 0x80000, and
+#: nothing above (checked across 25,440 genuine 3.3.5a emitters).  Everything
+#: higher arrived later, chief among them 0x800000 (gravity stored as packed
+#: vectors) and 0x10000000 (multi-texture emitters).
+M2_PARTICLE_FLAG_MASK = 0x000FFFFF
+M2_PARTICLE_FLAG_COMPRESSED_GRAVITY = 0x00800000
 M2_PARTICLE_FLAG_MULTI_TEXTURE = 0x10000000
+#: Scale of a packed gravity vector's 16-bit magnitude.
+M2_PACKED_GRAVITY_SCALE = 0.04238648
+
+#: M2Sequence.flags bits a 3.3.5a file carries (0x10 is set at runtime, and
+#: 0x100/0x200/0x800 are Legion's "in the model", "split blend time" and
+#: later additions; none appears in 94,186 genuine 3.3.5a sequences).
+M2_SEQUENCE_FLAG_MASK = 0x000000EF
 #: Emitter shapes: 1 plane and 2 sphere exist in 3.3.5a; 3 spline (Cata) and
 #: 4 bone (Legion) do not.
 M2_EMITTER_TYPES_SUPPORTED = (1, 2)
@@ -148,7 +158,10 @@ WMO_HEADER_FLAG_MASK = 0x000F
 
 #: MOGP.flags bits 3.3.5a understands. 0x08000000 and above are Legion+.
 WMO_GROUP_FLAG_MASK = 0x07FFFFFF
+WMO_GROUP_FLAG_HAS_BSP = 0x00000001
 WMO_GROUP_FLAG_HAS_VERTEX_COLORS = 0x00000004
+#: MPBV/MPBP/MPBI/MPBG; no genuine 3.3.5a group has them, and none is written.
+WMO_GROUP_FLAG_HAS_PORTAL_BATCHES = 0x00000400
 WMO_GROUP_FLAG_HAS_LIGHTS = 0x00000200
 WMO_GROUP_FLAG_HAS_DOODADS = 0x00000800
 WMO_GROUP_FLAG_HAS_WATER = 0x00001000

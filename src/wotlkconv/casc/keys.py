@@ -58,7 +58,7 @@ class KeyRing:
         return added
 
     @classmethod
-    def load(cls, path: str | os.PathLike[str]) -> "KeyRing":
+    def load(cls, path: str | os.PathLike[str]) -> KeyRing:
         ring = cls()
         p = Path(path)
         with p.open("r", encoding="utf-8", errors="replace") as fh:
@@ -68,7 +68,7 @@ class KeyRing:
         return ring
 
     @classmethod
-    def discover(cls, explicit=None, search_dirs=()) -> "KeyRing":
+    def discover(cls, explicit=None, search_dirs=()) -> KeyRing:
         """Load from an explicit path, then the environment, then probe."""
         if explicit:
             return cls.load(explicit)

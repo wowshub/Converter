@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import dataclasses
 import struct
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 WDC3_HEADER_SIZE = 72
 SECTION_HEADER_WDC3 = 40
@@ -62,7 +63,14 @@ def _layout_block(columns: Sequence[Col], layout_hash: str, build: str) -> list[
             prefix = ""
         width = ""
         if col.type == "int":
-            width = f"<{'' if col.signed else 'u'}{col.bits}>"
+            # A definition gives the value's width.  For a palletised or
+            # common-data column that is a whole word, whatever few bits the
+            # record spends on the slot.
+            bits = (32 if col.storage in (STORAGE_COMMON_DATA,
+                                          STORAGE_BITPACKED_INDEXED,
+                                          STORAGE_BITPACKED_INDEXED_ARRAY)
+                    else col.bits)
+            width = f"<{'' if col.signed else 'u'}{bits}>"
         array = f"[{col.array}]" if col.array > 1 else ""
         lines.append(f"{prefix}{col.name}{width}{array}")
     return lines
@@ -98,8 +106,15 @@ def build_wdc3(columns: Sequence[Col], rows: Sequence[dict[str, Any]], *,
                copies: Sequence[tuple[int, int]] = (),
                id_column: str | None = None,
                relationship: dict[int, int] | None = None,
-               encrypted: bool = False) -> bytes:
-    """Assemble a WDC2/3/4/5 table from column specs and Python rows."""
+               encrypted: bool = False,
+               encrypted_rows: int = 0) -> bytes:
+    """Assemble a WDC2/3/4/5 table from column specs and Python rows.
+
+    ``encrypted_rows`` (WDC3 onwards) adds a second section of that many
+    records encrypted with a key nobody has, zeroed the way a reader sees it --
+    the shape of every retail table with unreleased rows.  String offsets then
+    count from the records of *both* sections, as Blizzard writes them.
+    """
     inline = [c for c in columns if not c.non_inline]
     id_name = id_column or next((c.name for c in columns if c.is_id),
                                 columns[0].name)
@@ -109,10 +124,7 @@ def build_wdc3(columns: Sequence[Col], rows: Sequence[dict[str, Any]], *,
     storages: list[tuple[Col, int, int]] = []   # column, offset bits, size bits
     for col in inline:
         if col.storage in (STORAGE_BITPACKED_INDEXED,
-                           STORAGE_BITPACKED_INDEXED_ARRAY):
-            size = col.bits
-            total = size
-        elif col.storage in (STORAGE_BITPACKED, STORAGE_BITPACKED_SIGNED):
+                           STORAGE_BITPACKED_INDEXED_ARRAY) or col.storage in (STORAGE_BITPACKED, STORAGE_BITPACKED_SIGNED):
             size = col.bits
             total = size
         elif col.storage == STORAGE_COMMON_DATA:
@@ -169,10 +181,10 @@ def build_wdc3(columns: Sequence[Col], rows: Sequence[dict[str, Any]], *,
                     slots = getattr(col, "_slots", None)
                     if slots is None:
                         slots = {}
-                        col._slots = slots            # noqa: SLF001 - fixture
+                        col._slots = slots
                     slots[words] = len(col.pallet) // max(1, col.array)
                     col.pallet.extend(words)
-                slot = col._slots[words]              # noqa: SLF001 - fixture
+                slot = col._slots[words]
                 put_bits(record_data, record_base + offset_bits, slot, size_bits)
                 continue
 
@@ -187,9 +199,11 @@ def build_wdc3(columns: Sequence[Col], rows: Sequence[dict[str, Any]], *,
                     continue
                 put_bits(record_data, bit_at, _as_words(item, col.type), size_bits)
 
-    # String columns store an offset measured from the field's own position.
+    # String columns store an offset measured from the field's own position,
+    # among the records of every section.
+    all_records = len(record_data) + encrypted_rows * record_size
     for bit_at, field_absolute, text in pending_strings:
-        raw = len(record_data) + string_offsets[text] - field_absolute
+        raw = all_records + string_offsets[text] - field_absolute
         put_bits(record_data, bit_at, raw & 0xFFFFFFFF, 32)
 
     # -- pallet and common blocks -----------------------------------------
@@ -216,7 +230,9 @@ def build_wdc3(columns: Sequence[Col], rows: Sequence[dict[str, Any]], *,
             compression = [_as_words(col.common_default, col.type), 0, 0]
         elif col.storage in (STORAGE_BITPACKED, STORAGE_BITPACKED_SIGNED):
             compression = [offset_bits, size_bits, 0]
-        storage_infos.extend(struct.pack("<HHII3I", offset_bits, size_bits,
+        # An inline array's size is the whole array, as in real files.
+        whole = size_bits * col.array if col.storage == STORAGE_NONE else size_bits
+        storage_infos.extend(struct.pack("<HHII3I", offset_bits, whole,
                                          extra, col.storage, *compression))
 
     # -- section payload ---------------------------------------------------
@@ -277,7 +293,7 @@ def build_wdc3(columns: Sequence[Col], rows: Sequence[dict[str, Any]], *,
         out += struct.pack("<I", len(common_data))
         out += struct.pack("<I", len(pallet_data))
         out += struct.pack("<I", len(relationship_data))
-        for col, offset_bits, size_bits in storages:
+        for _col, offset_bits, size_bits in storages:
             out += struct.pack("<hH", 32 - (size_bits or 32), offset_bits // 8)
         out += storage_infos
         out += pallet_data
@@ -289,7 +305,8 @@ def build_wdc3(columns: Sequence[Col], rows: Sequence[dict[str, Any]], *,
     if magic == "WDC5":
         out += struct.pack("<I", 5)
         out += b"TestSchema".ljust(128, b"\0")
-    out += struct.pack("<I", len(rows))
+    sections = 2 if encrypted_rows else 1
+    out += struct.pack("<I", len(rows) + encrypted_rows)
     out += struct.pack("<I", len(inline))
     out += struct.pack("<I", record_size)
     out += struct.pack("<I", len(string_block))
@@ -307,7 +324,10 @@ def build_wdc3(columns: Sequence[Col], rows: Sequence[dict[str, Any]], *,
     out += struct.pack("<I", len(storage_infos))
     out += struct.pack("<I", len(common_data))
     out += struct.pack("<I", len(pallet_data))
-    out += struct.pack("<I", 1)                       # section_count
+    out += struct.pack("<I", sections)                # section_count
+    if encrypted_rows:
+        assert magic not in ("WDC2", "1SLC"), "second section is WDC3+ only"
+        header_size += SECTION_HEADER_WDC3
 
     out += struct.pack("<Q", 0x1122334455667788 if encrypted else 0)
     out += struct.pack("<I", header_size)             # file_offset
@@ -324,8 +344,14 @@ def build_wdc3(columns: Sequence[Col], rows: Sequence[dict[str, Any]], *,
         out += struct.pack("<I", len(relationship_data))
         out += struct.pack("<I", 0)                   # offset_map_id_count
         out += struct.pack("<I", len(copies))
+    if encrypted_rows:
+        out += struct.pack("<Q", 0x8877665544332211)  # nobody has this key
+        out += struct.pack("<I", header_size + len(section))
+        out += struct.pack("<I", encrypted_rows)
+        out += struct.pack("<I", 0)                   # string_table_size
+        out += struct.pack("<5I", 0, 0, 0, 0, 0)
 
-    for col, offset_bits, size_bits in storages:
+    for _col, offset_bits, size_bits in storages:
         out += struct.pack("<hH", 32 - (size_bits or 32), offset_bits // 8)
     out += storage_infos
     out += pallet_data
@@ -333,6 +359,7 @@ def build_wdc3(columns: Sequence[Col], rows: Sequence[dict[str, Any]], *,
 
     assert len(out) == header_size, (len(out), header_size)
     out += section if not encrypted else bytes(len(section))
+    out += bytes(encrypted_rows * record_size)
     return bytes(out)
 
 
@@ -378,12 +405,15 @@ def build_dbc(field_count: int, rows: Sequence[Sequence[Any]],
 
 def build_sparse_wdc3(columns, rows, *, magic: str = "WDC3",
                       layout_hash: int = 0x1FE1BDA4,
-                      id_column: str | None = None) -> bytes:
+                      id_column: str | None = None,
+                      relationship: dict[int, int] | None = None) -> bytes:
     """A sparse (offset-map) table: variable-length records, inline strings.
 
-    Laid out the way the format describes it -- record region, id list, copy
-    table, offset map, then the offset map's own id list -- so the reader's
-    walk of that order is what is being tested.
+    Laid out the way 12.1's files are -- record region, id list, copy table,
+    offset map, the offset map's own id list, *then* relationship data, whose
+    entries name each row by its id rather than its position -- so the
+    reader's walk of that order is what is being tested.  ``relationship`` is
+    ``{row id: foreign id}``.
     """
     inline = [c for c in columns if not c.non_inline]
     id_name = id_column or next((c.name for c in columns if c.is_id),
@@ -399,7 +429,7 @@ def build_sparse_wdc3(columns, rows, *, magic: str = "WDC3",
             for slot in range(col.array):
                 item = items[slot] if slot < len(items) else 0
                 if col.type == "string":
-                    blob += str(item).encode("latin-1") + b"\0"
+                    blob += str(item).encode("utf-8") + b"\0"
                 else:
                     blob += _as_words(item, col.type).to_bytes(
                         max(1, col.bits // 8), "little")
@@ -407,12 +437,20 @@ def build_sparse_wdc3(columns, rows, *, magic: str = "WDC3",
             blob += b"\0"
         blobs.append(bytes(blob))
 
+    relationship_data = b""
+    if relationship:
+        entries = sorted(relationship.items())
+        relationship_data = struct.pack("<III", len(entries), min(relationship),
+                                        max(relationship))
+        relationship_data += b"".join(struct.pack("<II", foreign, row_id)
+                                      for row_id, foreign in entries)
+
     storage_infos = bytearray()
     bit_offset = 0
     for col in inline:
         size_bits = col.bits
-        storage_infos += struct.pack("<HHII3I", bit_offset, size_bits, 0,
-                                     STORAGE_NONE, 0, 0, 0)
+        storage_infos += struct.pack("<HHII3I", bit_offset, size_bits * col.array,
+                                     0, STORAGE_NONE, 0, 0, 0)
         bit_offset += size_bits * col.array
 
     section_header_size = SECTION_HEADER_WDC3
@@ -456,7 +494,7 @@ def build_sparse_wdc3(columns, rows, *, magic: str = "WDC3",
     out += struct.pack("<I", 0)                       # string_table_size
     out += struct.pack("<I", records_end)             # offset_records_end
     out += struct.pack("<I", 0)                       # id_list_size
-    out += struct.pack("<I", 0)                       # relationship_data_size
+    out += struct.pack("<I", len(relationship_data))  # relationship_data_size
     out += struct.pack("<I", len(rows))               # offset_map_id_count
     out += struct.pack("<I", 0)                       # copy_table_count
 
@@ -464,4 +502,5 @@ def build_sparse_wdc3(columns, rows, *, magic: str = "WDC3",
         out += struct.pack("<hH", 32 - col.bits, 0)
     out += storage_infos
     assert len(out) == header_size, (len(out), header_size)
-    return bytes(out) + records + offset_map + offset_map_ids
+    return (bytes(out) + records + offset_map + offset_map_ids
+            + relationship_data)

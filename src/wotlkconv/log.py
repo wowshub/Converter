@@ -57,10 +57,7 @@ def _emit(level: int, msg: str) -> None:
     if level > _level:
         return
     prefix = _PREFIX[level]
-    if _use_colour:
-        line = f"{_COLOURS[level]}{prefix}:{_RESET} {msg}"
-    else:
-        line = f"{prefix}: {msg}"
+    line = f"{_COLOURS[level]}{prefix}:{_RESET} {msg}" if _use_colour else f"{prefix}: {msg}"
     with _lock:
         print(line, file=sys.stderr, flush=True)
 

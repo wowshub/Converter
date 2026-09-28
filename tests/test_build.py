@@ -3,13 +3,13 @@
 import json
 import zipfile
 
-import pytest
-
 import casc_fixtures as CF
 import fixtures as F
+import pytest
+
 from wotlkconv.cli import main
 from wotlkconv.errors import ConverterError
-from wotlkconv.fetch import (default_cache, fetch_definitions, fetch_listfile)
+from wotlkconv.fetch import default_cache, fetch_definitions, fetch_listfile
 
 
 @pytest.fixture
@@ -177,7 +177,7 @@ def test_an_archive_with_no_definitions_says_so(tmp_path):
     archive = tmp_path / "defs.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("WoWDBDefs-master/README.md", "nothing useful here")
-    with pytest.raises(ConverterError, match="held no .dbd definitions"):
+    with pytest.raises(ConverterError, match=r"held no \.dbd definitions"):
         fetch_definitions(tmp_path / "cache", url=archive.as_uri())
 
 
@@ -207,3 +207,18 @@ def test_fetching_is_never_automatic(install, tmp_path, monkeypatch):
     root, listfile = install
     assert main(["build", "--casc", str(root), "-o", str(tmp_path / "p"),
                  "-l", str(listfile)]) == 0
+
+
+def test_a_database_name_that_is_another_files_path_stays_that_files():
+    """ItemDisplayInfo joins named an icon by a cape texture's own path; the
+    icon's copy was written first and the cape texture was refused."""
+    from wotlkconv.cli import _without_other_files
+    from wotlkconv.pipeline import Job
+    jobs = [Job("blp", "interface/icons/cape_orange.blp", file_id=1043901),
+            Job("blp", "item/objectcomponents/cape/cape_orange.blp", file_id=1060495)]
+    aliases = {1043901: {"item\\objectcomponents\\cape\\cape_orange.blp",
+                         "interface\\icons\\inv_cape_orange.blp"},
+               1060495: {"item\\objectcomponents\\cape\\cape_orange.blp"}}
+    assert _without_other_files(aliases, jobs) == {
+        1043901: {"interface\\icons\\inv_cape_orange.blp"},
+        1060495: {"item\\objectcomponents\\cape\\cape_orange.blp"}}

@@ -8,8 +8,8 @@ chunk it was is the difference between a report and a shrug.
 
 import struct
 
-
 import fixtures as F
+
 from wotlkconv.adt.convert import AdtParts, convert_adt
 from wotlkconv.adt.wdt import convert_wdt
 from wotlkconv.listfile import Listfile

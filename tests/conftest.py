@@ -27,6 +27,7 @@ LISTFILE_ENTRIES = [
     "810001;world/doodads/tree.m2",
     "810002;world/doodads/rock.m2",
     "820001;environments/stars/sky.m2",
+    "840001;world/wmo/dungeon/keep.wmo",
     "700001;tileset/generic/grass.blp",
     "700002;tileset/generic/rock.blp",
 ]
