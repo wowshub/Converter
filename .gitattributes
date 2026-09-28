@@ -1,0 +1,12 @@
+# Every file tracked here is text, so normalise line endings to LF in the
+# repository and check them out as LF on every platform. Without this, a
+# contributor whose git has core.autocrlf=true checks the tree out as CRLF and
+# then sees whole-file diffs on anything they touch.
+#
+# text=auto still detects a genuinely binary file and leaves it alone, so no
+# per-extension binary rules are needed. The game assets this tool reads are
+# never committed; .gitignore blocks them.
+* text=auto eol=lf
+
+# Python-aware hunk headers, so a diff says which function it is in.
+*.py diff=python
