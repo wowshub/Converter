@@ -20,6 +20,31 @@ wotlkconv convert --casc "C:\World of Warcraft" --include "creature/**" \
                   -o patch-4/ --listfile listfile.csv -j4
 ```
 
+**Python 3.10 or newer. No third-party dependencies.**
+
+- Reads a game install's CASC storage directly, or a folder extracted earlier.
+- Converts models, skins, animations, skeletons, textures, terrain tiles, map
+  indices, world objects and client databases — [the full list](#what-it-converts).
+- Copies through what 3.3.5a already reads, and skips the rest *with the reason*.
+- Every input is accounted for: written, carried by another file, skipped or
+  failed, and [the totals have to add up](#nothing-is-silently-discarded-and-the-run-proves-it).
+- Turns FileDataIDs back into paths with the community listfile.
+- 836 tests that need no network and no game data.
+
+**Contents** — [Quick start](#the-short-version) ·
+[What it converts](#what-it-converts) ·
+[Everything else](#what-it-does-with-everything-else) ·
+[Databases](#client-databases) ·
+[Oversized meshes](#meshes-too-big-for-16-bit-indices) ·
+[Reading an install](#reading-a-game-install) ·
+[Install](#install) ·
+[Listfile](#you-will-want-a-listfile) ·
+[Usage](#usage) ·
+[What downgrading costs](#downgrading-is-lossy-and-it-says-so) ·
+[Docs](#documentation) ·
+[As a library](#using-it-as-a-library) ·
+[Development](#development)
+
 ## The short version
 
 One command takes a game install and produces a patch:
@@ -36,6 +61,11 @@ turns FileDataIDs back into paths, and
 [WoWDBDefs](https://github.com/wowdev/WoWDBDefs), without which every database
 is refused — and caches them for next time. Supply them yourself with
 `--listfile` and `--dbd` and you never need the network.
+
+While it converts it logs a line each time another whole percent of the files
+is done, with the time taken and an estimate of what is left
+(`progress: 37% (215,040 of 581,187 files, 26m 12s elapsed, about 44m 36s
+left)`); `-q` silences it along with the other information messages.
 
 It works without either, too: files the listfile cannot name arrive under their
 FileDataID, and the run says so rather than quietly coming up short.
@@ -56,16 +86,16 @@ explicit, and a selection you have to state.
 |---|---|---|---|
 | `.m2` | version 264–274, `MD21`-chunked | version 264, flat `MD20` | merges `.skel` skeletons back in, resolves `TXID` textures |
 | `.skin` | Legion 56-byte header | Wrath 48-byte header | drops shadow batches, clamps batch limits |
-| `.anim` | `AFM2`-chunked | flat blob | drops physics bone tracks |
+| `.anim` | `AFM2`/`AFSB`/`AFSA`-chunked | flat blob | lays a skeleton's bone and attachment keyframes after the model's own and repoints them |
 | `.skel` | Legion+ | *(merged into the model)* | including `SKPD` parent chains |
 | `.blp` | BLP2, any encoding incl. BC5 | DXT1/3/5, palettised or raw | already-valid block data is copied byte for byte |
 | `.wmo` root | Legion/BfA/Shadowlands | 3.3.5a v17 | rebuilds `MOTX`/`MODN`/`MOSB` from `MODI`/`MOSI` |
 | `.wmo` group | Shadowlands `MOVX`/`MPY2` | `MOVI`/`MOPY` | recomputes batch bounds, trims UV/colour layers |
-| `.adt` | Cataclysm+ split tiles | monolithic Wrath tile | rebuilds `MCIN`, merges `_tex0` and `_obj0` |
-| `.wdt` | BfA+ with `MAID` | 3.3.5a v17 | drops `MAID`, sets the big-alpha flag |
+| `.adt` | Cataclysm+ split tiles | monolithic Wrath tile | rebuilds `MCIN`, merges `_tex0` and `_obj0`, names FileDataID placements, re-encodes liquid in Wrath vertex formats |
+| `.wdt` | BfA+ with `MAID` | 3.3.5a v17 | drops `MAID`, sets the big-alpha flag, names a global WMO placed by FileDataID |
 | `.wdl` | Legion+ with the `ML*` LOD mesh | 3.3.5a heightmap | keeps `MAOF`/`MARE`/`MAHO`, rewrites every offset |
-| `.wlw` `.wlq` `.wlm` | liquid volumes | unchanged | version-checked; a version Wrath cannot parse is refused, not shipped |
-| `.db2` | WDC1–WDC5 (Legion 7.3 onwards) | `.dbc` | needs a DBD definition; the layout comes from the definition too |
+| minimap `.blp` | `World/Minimaps/...` by map and WMO | `Textures/Minimap/<md5>.blp` | writes the `md5translate.trs` index 3.3.5a finds them through |
+| `.db2` | WDC1–WDC5 (Legion 7.3 onwards) | `.dbc` | needs a DBD definition; the layout comes from the definition too, byte-wide columns and localised strings included; ItemDisplayInfo is joined from the tables that now hold its names |
 
 Companion files are found automatically and renamed into the layout the client
 globs for — `Bear.m2` gets `Bear00.skin` … `Bear03.skin` and
@@ -91,9 +121,13 @@ buckets, and the report says which:
   `.phys` physics rigs, `.bone` overrides, `.mdx` pre-Wrath models, compiled
   `.bls` shaders, `.png`/`.tga` art, per-asset `.meta` records, the
   `.pm4`/`.pd4` development pathing data, the map sidecars (`_lgt.wdt` lights,
-  `_occ.wdt` occlusion, `_fogs.wdt`, `_mpv.wdt`, `_lod.adt`) that carry data
-  for systems Wrath does not have, and the launcher and operating-system files
-  that travel in the same archives.
+  `_occ.wdt` occlusion, `_fogs.wdt`, `_mpv.wdt`, `_lod.adt` — empty ones
+  included) that carry data for systems Wrath does not have, `.wlw`/`.wlq`/
+  `.wlm` liquid volumes (3.3.5a takes liquid from terrain and world-object
+  chunks and never loads these), a model's LOD skins and a WMO's LOD groups,
+  client databases for tables Wrath never had, textures Blizzard ships empty,
+  and the launcher and operating-system files that travel in the same
+  archives.
 
 ### Nothing is silently discarded, and the run proves it
 
@@ -177,6 +211,24 @@ source is reported by name rather than quietly written as zero.
 They are plain JSON — `--db-mappings DIR` overrides any of them, and adding a
 table means writing one file, not changing code.
 
+A table that did not exist in Wrath — 951 of 12.1's — has nothing to be written
+into, and is skipped saying so. The layouts that do exist are exact: derived
+from the definitions, every one of a clean 3.3.5a client's 245 tables comes out
+with the right field count *and* record size, including localised strings (16
+locale slots and a mask in Wrath, one string in a modern file) and the five
+tables that pack columns into single bytes.
+
+**ItemDisplayInfo** needs more than a mapping: modern builds keep none of its
+model, texture or icon names on the row. They are joined from ModelFileData,
+TextureFileData, ItemDisplayInfoMaterialRes and ItemAppearance, and the join
+reproduces a clean 3.3.5a client's own table on the 36,438 ids both share —
+model names 99.9%, armour textures 99.2%, icons 80% (several items share one
+display, so no pick can do better than 85%). Names are only useful if the client
+finds the files, so a `convert`/`build` run also writes each file the table
+refers to under the name Wrath looks for: helmets as `Helm_X_HuM.m2` with their
+skins, armour textures as `<Section>Texture\<name>_U.blp`, model textures beside
+their model and icons in `Interface\Icons`.
+
 A `--template` is still worth passing: it cross-checks the derived layout and
 hard-fails on disagreement. It cannot *replace* the definition, though — a
 `.dbc` records how many columns there are, never what belongs in them, so a
@@ -228,11 +280,21 @@ wotlkconv casc extract --casc /games/wow -l listfile.csv \
 Selection is deliberately explicit: `--include "**"` takes the whole build, and
 a modern build is millions of files.
 
-Only **local** storage is read. Modern installs can be partial, streaming the
-rest from Blizzard's CDN on demand; files that are not on disk are reported as
-unavailable rather than downloaded. Encrypted files (Blizzard ships unreleased
-content that way) decode if you pass `--casc-keys` a community key ring, and
-are reported per file if you do not.
+By default only **local** storage is read. Modern installs are partial —
+12.1.0.69814 streams 4,550 files (9.6 GB) on demand — and without further
+flags those are reported as not installed. **`--casc-cdn`** fetches them from
+Blizzard's CDN instead: the install already holds every archive index, so each
+file is located locally and only its own bytes are requested, then checked
+against its encoding key and its content key before use and cached
+(`--casc-cdn-cache`, default `~/.cache/wotlkconv/cdn`) so no file is fetched
+twice.
+
+Encrypted files (Blizzard ships unreleased content that way) decode if you pass
+`--casc-keys` a key ring such as the community
+[TACTKeys](https://github.com/wowdev/TACTKeys) `WoW.txt`; `build --fetch`
+downloads it. On 12.1 the public keys open 27,947 of 32,284 encrypted files;
+the rest stay reported per file. A client database with a few encrypted
+sections is still read — those rows are skipped, not the table.
 
 `--casc-product` picks between products in a multi-product install
 (`wow`, `wow_classic`, `wowt`, …) and `--casc-locale` chooses which localised
@@ -263,9 +325,10 @@ wotlkconv convert ... --listfile community-listfile.csv
 Set `WOTLKCONV_LISTFILE` instead of passing the flag every time, or drop a
 `listfile.csv` in the working directory and it is found automatically.
 
-Without one, textures and doodads are pointed at `unresolved\blp\1234567.blp`
-placeholder paths: the files still load, but you have to repoint the references
-yourself. `--unresolved fail` turns that into an error instead, and
+Without one, textures and doodads are pointed at `unknown\1234567.blp` — the
+name a build gives a file it has no listfile entry for, so a reference to one
+that is in the build still finds it; for one that is not, you have to supply or
+repoint it yourself. `--unresolved fail` turns that into an error instead, and
 `--unresolved strip` empties the reference.
 
 ## Usage
@@ -406,7 +469,7 @@ converter is a pure function of bytes, so they parallelise without shared state.
 ## Development
 
 ```bash
-python -m pytest tests/ -q      # 661 tests, no network or game data needed
+python -m pytest tests/ -q      # 836 tests, no network or game data needed
 python -m ruff check src tests
 ```
 
